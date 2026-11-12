@@ -12,7 +12,18 @@ A native Windows notch/pill island. Built with Rust, tiny-skia, and the Win32 AP
 - `Ctrl+Alt+Q` quits.
 - Transparent, always-on-top, no-activate window with click-through outside the island.
 - DPI-aware and crisp on scaled displays.
+- Adaptive frame pacing: detects the monitor refresh rate and animates at
+  120Hz or 60Hz without changing animation duration.
 - Clock and native-feeling shell UI.
+
+Animations are time-based, so the same spring feels identical on a 60Hz and
+120Hz panel. Idle behavior drops to a low-frequency cursor poll instead of
+running the render loop continuously. For testing, override the detected rate:
+
+```powershell
+$env:PONI_REFRESH_HZ = "60"
+.\target\release\poni.exe
+```
 
 ## Build
 

@@ -6,6 +6,7 @@ mod island;
 use std::ffi::c_void;
 use std::path::PathBuf;
 use std::ptr::null_mut;
+use std::time::Instant;
 
 use chrono::Local;
 use fontdue::{Font, FontSettings};
@@ -14,7 +15,11 @@ use island::{draw as draw_island, IslandView};
 use serde::{Deserialize, Serialize};
 use tiny_skia::Pixmap;
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM};
+use windows::Win32::Foundation::{
+    CloseHandle, BOOL, COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, SIZE,
+    WAIT_OBJECT_0, WPARAM,
+};
+use windows::Win32::Graphics::Dwm::{DwmGetCompositionTimingInfo, DWM_TIMING_INFO};
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, GetMonitorInfoW,
     MonitorFromPoint, ReleaseDC, ScreenToClient, SelectObject, UpdateWindow, AC_SRC_ALPHA,
@@ -22,6 +27,10 @@ use windows::Win32::Graphics::Gdi::{
     MONITORINFO, MONITOR_DEFAULTTOPRIMARY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::{
+    CreateWaitableTimerExW, SetWaitableTimer, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, INFINITE,
+    TIMER_ALL_ACCESS,
+};
 use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
@@ -29,21 +38,23 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, UnregisterHotKey, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW,
-    GetWindowLongPtrW, KillTimer, LoadCursorW, PostQuitMessage, RegisterClassW, SetTimer,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, UpdateLayeredWindow,
-    CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HTCLIENT, HTTRANSPARENT, HWND_TOPMOST,
-    IDC_ARROW, MA_NOACTIVATE, MSG, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_SHOWNOACTIVATE, ULW_ALPHA,
-    WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_HOTKEY, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE,
-    WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
+    GetWindowLongPtrW, LoadCursorW, MsgWaitForMultipleObjectsEx, PeekMessageW, PostQuitMessage,
+    RegisterClassW, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
+    UpdateLayeredWindow, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HTCLIENT,
+    HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW, MA_NOACTIVATE, MSG, MWMO_INPUTAVAILABLE, PM_REMOVE,
+    QS_ALLINPUT, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_SHOWNOACTIVATE, ULW_ALPHA, WM_CREATE,
+    WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_HOTKEY, WM_LBUTTONUP, WM_MOUSEACTIVATE,
+    WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_QUIT, WM_RBUTTONUP, WNDCLASSW,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 const WINDOW_CLASS: PCWSTR = w!("PoniIslandWindow");
 const WINDOW_TITLE: PCWSTR = w!("Poni");
 const HOTKEY_MODE: i32 = 1;
 const HOTKEY_QUIT: i32 = 2;
-const TIMER_ID: usize = 1;
+const ANIMATION_RATE: f32 = 18.0;
+const MODE_RATE: f32 = 13.0;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Settings {
@@ -71,10 +82,13 @@ struct App {
     surface: Option<LayeredSurface>,
     font: Option<Font>,
     time: String,
+    timer: HANDLE,
+    refresh_hz: f32,
+    last_tick: Instant,
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(timer: HANDLE) -> Self {
         let mode = load_settings().mode;
         Self {
             hwnd: HWND::default(),
@@ -89,13 +103,18 @@ impl App {
             surface: None,
             font: load_font(),
             time: Local::now().format("%H:%M").to_string(),
+            timer,
+            refresh_hz: detect_refresh_rate(),
+            last_tick: Instant::now(),
         }
     }
 
     unsafe fn attach(&mut self, hwnd: HWND) {
         self.hwnd = hwnd;
         self.scale = dpi_scale(hwnd);
+        self.refresh_hz = detect_refresh_rate();
         self.resize_window();
+        log_line(&format!("Poni started at {:.1} Hz", self.refresh_hz));
 
         let _ = RegisterHotKey(
             hwnd,
@@ -110,7 +129,6 @@ impl App {
             'Q' as u32,
         );
 
-        let _ = SetTimer(hwnd, TIMER_ID, 33, None);
         self.redraw();
     }
 
@@ -170,6 +188,13 @@ impl App {
     }
 
     unsafe fn tick(&mut self) {
+        let now = Instant::now();
+        let dt = now
+            .duration_since(self.last_tick)
+            .as_secs_f32()
+            .clamp(0.001, 0.05);
+        self.last_tick = now;
+
         let mut point = POINT::default();
         if GetCursorPos(&mut point).is_ok() {
             let _ = ScreenToClient(self.hwnd, &mut point);
@@ -182,22 +207,46 @@ impl App {
             0.0
         };
         let target_mode = self.mode.mix();
-        let now = Local::now().format("%H:%M").to_string();
+        let clock = Local::now().format("%H:%M").to_string();
 
         let mut changed = false;
-        if self.time != now {
-            self.time = now;
+        if self.time != clock {
+            self.time = clock;
             changed = true;
         }
-        if approach(&mut self.progress, target, 0.22) {
+        if approach(&mut self.progress, target, dt, ANIMATION_RATE) {
             changed = true;
         }
-        if approach(&mut self.mode_mix, target_mode, 0.18) {
+        if approach(&mut self.mode_mix, target_mode, dt, MODE_RATE) {
             changed = true;
         }
 
         if changed {
             self.redraw();
+        }
+    }
+
+    fn request_frame(&self) {
+        unsafe {
+            set_frame_timer(self.timer, 1.0);
+        }
+    }
+
+    fn next_interval_ms(&self) -> f32 {
+        let target = if self.pinned || self.hovered {
+            1.0
+        } else {
+            0.0
+        };
+        let animating = (self.progress - target).abs() > 0.002
+            || (self.mode_mix - self.mode.mix()).abs() > 0.002;
+
+        if animating {
+            1000.0 / self.refresh_hz.max(30.0)
+        } else if self.progress > 0.001 {
+            33.0
+        } else {
+            35.0
         }
     }
 
@@ -225,23 +274,26 @@ impl App {
     unsafe fn toggle_mode(&mut self) {
         self.mode = self.mode.toggle();
         save_settings(self.mode);
-        let _ = SetTimer(self.hwnd, TIMER_ID, 24, None);
-        self.redraw();
+        self.request_frame();
     }
 
     unsafe fn toggle_pin(&mut self) {
         self.pinned = !self.pinned;
-        let _ = SetTimer(self.hwnd, TIMER_ID, 24, None);
+        self.request_frame();
     }
 }
 
-fn approach(current: &mut f32, target: f32, factor: f32) -> bool {
+fn approach(current: &mut f32, target: f32, dt: f32, rate: f32) -> bool {
     let delta = target - *current;
     if delta.abs() < 0.002 {
         *current = target;
         return false;
     }
-    *current += delta * factor;
+    let alpha = 1.0 - (-rate * dt).exp();
+    *current += delta * alpha;
+    if (target - *current).abs() < 0.002 {
+        *current = target;
+    }
     true
 }
 
@@ -254,6 +306,46 @@ fn dpi_scale(hwnd: HWND) -> f32 {
             dpi as f32 / 96.0
         }
     }
+}
+
+fn detect_refresh_rate() -> f32 {
+    if let Ok(value) = std::env::var("PONI_REFRESH_HZ") {
+        if let Ok(hz) = value.parse::<f32>() {
+            if hz.is_finite() && (30.0..=240.0).contains(&hz) {
+                return hz;
+            }
+        }
+    }
+
+    unsafe {
+        let mut info = DWM_TIMING_INFO::default();
+        info.cbSize = std::mem::size_of::<DWM_TIMING_INFO>() as u32;
+        if DwmGetCompositionTimingInfo(None, &mut info).is_ok() && info.qpcRefreshPeriod > 0 {
+            let hz = 10_000_000.0 / info.qpcRefreshPeriod as f32;
+            if hz.is_finite() && (30.0..=240.0).contains(&hz) {
+                return hz;
+            }
+        }
+    }
+    60.0
+}
+
+unsafe fn create_frame_timer() -> windows::core::Result<HANDLE> {
+    CreateWaitableTimerExW(
+        None,
+        w!(""),
+        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+        TIMER_ALL_ACCESS.0,
+    )
+    .or_else(|_| CreateWaitableTimerExW(None, w!(""), 0, TIMER_ALL_ACCESS.0))
+}
+
+unsafe fn set_frame_timer(timer: HANDLE, interval_ms: f32) {
+    if timer.0.is_null() {
+        return;
+    }
+    let due = -((interval_ms.max(0.5) * 10_000.0) as i64);
+    let _ = SetWaitableTimer(timer, &due, 0, None, None, BOOL(0));
 }
 
 fn settings_path() -> Option<PathBuf> {
@@ -466,7 +558,7 @@ unsafe extern "system" fn wnd_proc(
         WM_MOUSEMOVE => {
             if let Some(app) = app_mut(hwnd) {
                 app.hovered = true;
-                let _ = SetTimer(hwnd, TIMER_ID, 24, None);
+                app.request_frame();
             }
             LRESULT(0)
         }
@@ -479,12 +571,6 @@ unsafe extern "system" fn wnd_proc(
         WM_RBUTTONUP => {
             if let Some(app) = app_mut(hwnd) {
                 app.toggle_mode();
-            }
-            LRESULT(0)
-        }
-        WM_TIMER if wparam.0 == TIMER_ID => {
-            if let Some(app) = app_mut(hwnd) {
-                app.tick();
             }
             LRESULT(0)
         }
@@ -505,14 +591,21 @@ unsafe extern "system" fn wnd_proc(
         WM_DPICHANGED => {
             if let Some(app) = app_mut(hwnd) {
                 app.scale = dpi_scale(hwnd);
+                app.refresh_hz = detect_refresh_rate();
                 app.resize_window();
-                app.redraw();
+                app.request_frame();
+            }
+            LRESULT(0)
+        }
+        WM_DISPLAYCHANGE => {
+            if let Some(app) = app_mut(hwnd) {
+                app.refresh_hz = detect_refresh_rate();
+                app.request_frame();
             }
             LRESULT(0)
         }
         WM_DESTROY => {
             unsafe {
-                let _ = KillTimer(hwnd, TIMER_ID);
                 let _ = UnregisterHotKey(hwnd, HOTKEY_MODE);
                 let _ = UnregisterHotKey(hwnd, HOTKEY_QUIT);
             }
@@ -576,7 +669,15 @@ fn main() {
             return;
         }
 
-        let app = Box::into_raw(Box::new(App::new()));
+        let timer = match create_frame_timer() {
+            Ok(timer) => timer,
+            Err(err) => {
+                log_line(&format!("CreateWaitableTimerExW failed: {err}"));
+                return;
+            }
+        };
+
+        let app = Box::into_raw(Box::new(App::new(timer)));
         let hwnd = match CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
             WINDOW_CLASS,
@@ -594,17 +695,57 @@ fn main() {
             Ok(hwnd) => hwnd,
             Err(err) => {
                 drop(Box::from_raw(app));
+                let _ = CloseHandle(timer);
                 log_line(&format!("CreateWindowExW failed: {err}"));
                 return;
             }
         };
 
         let _ = UpdateWindow(hwnd);
+        set_frame_timer(timer, 1.0);
 
-        let mut message = MSG::default();
-        while GetMessageW(&mut message, None, 0, 0).as_bool() {
-            let _ = TranslateMessage(&message);
-            DispatchMessageW(&message);
+        let mut running = true;
+        while running {
+            let wait = MsgWaitForMultipleObjectsEx(
+                Some(&[timer]),
+                INFINITE,
+                QS_ALLINPUT,
+                MWMO_INPUTAVAILABLE,
+            );
+
+            let mut ticked = false;
+            if wait == WAIT_OBJECT_0 {
+                if let Some(app) = app_mut(hwnd) {
+                    app.tick();
+                    ticked = true;
+                }
+            }
+
+            let mut message = MSG::default();
+            while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
+                if message.message == WM_QUIT {
+                    running = false;
+                    break;
+                }
+                let _ = TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+
+            if !running {
+                break;
+            }
+
+            if let Some(app) = app_mut(hwnd) {
+                if !ticked {
+                    app.tick();
+                }
+                let interval = app.next_interval_ms();
+                set_frame_timer(timer, interval);
+            } else {
+                break;
+            }
         }
+
+        let _ = CloseHandle(timer);
     }
 }
