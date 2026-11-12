@@ -34,7 +34,26 @@ pub fn draw(width: u32, height: u32, view: &IslandView<'_>) -> Option<Pixmap> {
 
 fn draw_shape(pixmap: &mut Pixmap, view: &IslandView<'_>) {
     let geo = view.geometry;
-    let Some(path) = island_path(&geo) else {
+
+    if view.mode_mix > 0.01 {
+        let mut shadow_geo = geo;
+        shadow_geo.x -= 1.0 * view.scale;
+        shadow_geo.y += 4.0 * view.scale;
+        shadow_geo.width += 2.0 * view.scale;
+        if let Some(shadow) = island_path(&shadow_geo, view.mode_mix) {
+            let mut paint = Paint::default();
+            paint.set_color_rgba8(0, 0, 0, (58.0 * view.mode_mix) as u8);
+            pixmap.fill_path(
+                &shadow,
+                &paint,
+                FillRule::Winding,
+                Transform::identity(),
+                None,
+            );
+        }
+    }
+
+    let Some(path) = island_path(&geo, view.mode_mix) else {
         return;
     };
 
@@ -72,8 +91,9 @@ fn draw_content(pixmap: &mut Pixmap, view: &IslandView<'_>) {
     let cream = ColorU8::from_rgba(245, 241, 232, 245);
     let muted = ColorU8::from_rgba(190, 184, 174, 185);
 
-    let collapsed_alpha = 1.0 - smoothstep(0.15, 0.45, view.progress);
-    let expanded_alpha = smoothstep(0.50, 0.92, view.progress);
+    let content_mix = smoothstep(0.35, 0.72, view.progress);
+    let collapsed_alpha = 1.0 - content_mix;
+    let expanded_alpha = content_mix;
 
     if collapsed_alpha > 0.01 {
         draw_collapsed(pixmap, view, collapsed_alpha, accent, cream, muted);
@@ -166,8 +186,9 @@ fn draw_expanded(
         1.0 - view.mode_mix
     };
     let start = view.mode.toggle();
-    let out_alpha = alpha * (1.0 - smoothstep(0.0, 0.5, to_target));
-    let in_alpha = alpha * smoothstep(0.5, 1.0, to_target);
+    let label_mix = smoothstep(0.28, 0.72, to_target);
+    let out_alpha = alpha * (1.0 - label_mix);
+    let in_alpha = alpha * label_mix;
 
     let label_size = 10.0 * s;
     let label_baseline = geo.y + 34.0 * s;
@@ -270,7 +291,7 @@ fn draw_expanded(
     );
 }
 
-fn island_path(geo: &Geometry) -> Option<Path> {
+fn island_path(geo: &Geometry, mode_mix: f32) -> Option<Path> {
     let x = geo.x;
     let y = geo.y;
     let width = geo.width;
@@ -285,7 +306,7 @@ fn island_path(geo: &Geometry) -> Option<Path> {
     // radius opens up, so there is no topology swap and no visible pop.
     let top_edge_left = x - flare + top_radius;
     let top_edge_right = x + width + flare - top_radius;
-    let drop = shoulder.max(top_radius);
+    let drop = lerp(shoulder, top_radius, mode_mix.clamp(0.0, 1.0));
     let mut pb = PathBuilder::new();
 
     pb.move_to(top_edge_left, y);
