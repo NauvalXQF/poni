@@ -15,9 +15,9 @@ pub const EXPANDED_RADIUS: f32 = 38.0;
 pub const NOTICE_RADIUS: f32 = NOTICE_HEIGHT / 2.0;
 
 /// How far the attached lip reaches past the body on each side, in logical pixels.
-pub const NOTCH_FLARE: f32 = 20.0;
+pub const NOTCH_FLARE: f32 = 10.0;
 /// How far the attached shoulder drops from the top edge, in logical pixels.
-pub const NOTCH_SHOULDER: f32 = 14.0;
+pub const NOTCH_SHOULDER: f32 = 8.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
