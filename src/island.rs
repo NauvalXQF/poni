@@ -29,7 +29,7 @@ pub struct IslandView<'a> {
     pub notice_title: Option<&'a str>,
     pub notice_subtitle: Option<&'a str>,
     pub notice_battery: Option<u8>,
-    pub notice_phase: f32,
+    pub notice_closing: bool,
     pub regular: Option<&'a Font>,
     pub semibold: Option<&'a Font>,
 }
@@ -107,20 +107,48 @@ fn draw_content(pixmap: &mut Pixmap, view: &IslandView<'_>) {
     let accent = ColorU8::from_rgba(255, 178, 36, 255);
     let cream = ColorU8::from_rgba(245, 241, 232, 245);
     let muted = ColorU8::from_rgba(190, 184, 174, 185);
+    let alphas = content_alphas(view.progress, view.notice_mix, view.notice_closing);
 
-    let content_mix = smoothstep(0.35, 0.72, view.progress);
-    let normal_alpha = 1.0 - view.notice_mix;
-    let collapsed_alpha = (1.0 - content_mix) * normal_alpha;
-    let expanded_alpha = content_mix * normal_alpha;
+    if alphas.collapsed > 0.01 {
+        draw_collapsed(pixmap, view, alphas.collapsed, cream, muted);
+    }
+    if alphas.expanded > 0.01 {
+        draw_expanded(pixmap, view, alphas.expanded, accent, cream, muted);
+    }
+    if alphas.notice > 0.01 && view.notice_kind.is_some() {
+        draw_notice(pixmap, view, alphas.notice, cream, muted);
+    }
+}
 
-    if collapsed_alpha > 0.01 {
-        draw_collapsed(pixmap, view, collapsed_alpha, cream, muted);
-    }
-    if expanded_alpha > 0.01 {
-        draw_expanded(pixmap, view, expanded_alpha, accent, cream, muted);
-    }
-    if view.notice_mix > 0.01 {
-        draw_notice(pixmap, view, cream, muted);
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ContentAlphas {
+    collapsed: f32,
+    expanded: f32,
+    notice: f32,
+}
+
+/// Content fade windows are intentionally disjoint. Compact content leaves
+/// before expanded content arrives, and notice text waits for compact content
+/// to leave. On the way out the order reverses.
+fn content_alphas(progress: f32, notice_mix: f32, notice_closing: bool) -> ContentAlphas {
+    let progress = progress.clamp(0.0, 1.0);
+    let notice_mix = notice_mix.clamp(0.0, 1.0);
+    let (base_alpha, notice) = if notice_closing {
+        (
+            1.0 - smoothstep(0.05, 0.28, notice_mix),
+            smoothstep(0.30, 0.70, notice_mix),
+        )
+    } else {
+        (
+            1.0 - smoothstep(0.05, 0.30, notice_mix),
+            smoothstep(0.35, 0.80, notice_mix),
+        )
+    };
+
+    ContentAlphas {
+        collapsed: (1.0 - smoothstep(0.05, 0.45, progress)) * base_alpha,
+        expanded: smoothstep(0.55, 0.95, progress) * base_alpha,
+        notice,
     }
 }
 
@@ -187,7 +215,13 @@ fn draw_collapsed(
     );
 }
 
-fn draw_notice(pixmap: &mut Pixmap, view: &IslandView<'_>, cream: ColorU8, muted: ColorU8) {
+fn draw_notice(
+    pixmap: &mut Pixmap,
+    view: &IslandView<'_>,
+    alpha: f32,
+    cream: ColorU8,
+    muted: ColorU8,
+) {
     let (Some(kind), Some(title), Some(subtitle)) =
         (view.notice_kind, view.notice_title, view.notice_subtitle)
     else {
@@ -199,41 +233,18 @@ fn draw_notice(pixmap: &mut Pixmap, view: &IslandView<'_>, cream: ColorU8, muted
     let semibold = view.semibold.unwrap_or(regular);
     let s = view.scale;
     let geo = view.geometry;
-    let alpha = view.notice_mix;
     let icon_x = geo.x + 27.0 * s;
     let center_y = geo.y + geo.height / 2.0;
     let icon_color = scale_alpha(cream, alpha);
 
-    if kind == NoticeKind::Bluetooth {
-        draw_bluetooth_ring(
-            pixmap,
-            icon_x,
-            center_y,
-            18.0 * s,
-            view.notice_phase,
-            view.notice_battery,
-            alpha,
-            icon_color,
-        );
-    } else {
-        draw_filled_circle(
-            pixmap,
-            icon_x,
-            center_y,
-            17.0 * s,
-            ColorU8::from_rgba(255, 255, 255, (10.0 * alpha) as u8),
-        );
-    }
-
-    draw_notice_icon(
+    draw_filled_circle(
         pixmap,
-        kind,
         icon_x,
         center_y,
-        20.0 * s,
-        icon_color,
-        view.notice_phase,
+        17.0 * s,
+        ColorU8::from_rgba(255, 255, 255, (12.0 * alpha) as u8),
     );
+    draw_notice_icon(pixmap, kind, icon_x, center_y, 20.0 * s, icon_color);
 
     draw_text(
         pixmap,
@@ -279,84 +290,17 @@ fn draw_notice_icon(
     cy: f32,
     size: f32,
     color: ColorU8,
-    phase: f32,
 ) {
     match kind {
-        NoticeKind::Wifi => draw_wifi_icon(pixmap, cx, cy, size, color, phase),
+        NoticeKind::Wifi => draw_wifi_icon(pixmap, cx, cy, size, color),
         NoticeKind::Bluetooth => draw_bluetooth_icon(pixmap, cx, cy, size, color),
         NoticeKind::Airplane => draw_airplane_icon(pixmap, cx, cy, size, color),
     }
 }
 
-fn draw_bluetooth_ring(
-    pixmap: &mut Pixmap,
-    cx: f32,
-    cy: f32,
-    radius: f32,
-    phase: f32,
-    battery: Option<u8>,
-    alpha: f32,
-    color: ColorU8,
-) {
-    draw_filled_circle(
-        pixmap,
-        cx,
-        cy,
-        radius + 5.0,
-        ColorU8::from_rgba(255, 255, 255, (7.0 * alpha) as u8),
-    );
-    draw_filled_circle(
-        pixmap,
-        cx,
-        cy,
-        radius + 2.0,
-        ColorU8::from_rgba(255, 255, 255, (11.0 * alpha) as u8),
-    );
-    draw_arc(
-        pixmap,
-        cx,
-        cy,
-        radius,
-        0.0,
-        360.0,
-        scale_alpha(color, alpha * 0.22),
-        1.0,
-    );
-
-    if let Some(battery) = battery {
-        let sweep = 360.0 * battery as f32 / 100.0;
-        draw_arc(
-            pixmap,
-            cx,
-            cy,
-            radius,
-            -90.0,
-            -90.0 + sweep,
-            scale_alpha(GREEN, alpha),
-            1.8,
-        );
-    } else {
-        let start = -90.0 + phase * 120.0;
-        draw_arc(
-            pixmap,
-            cx,
-            cy,
-            radius,
-            start,
-            start + 110.0,
-            scale_alpha(color, alpha * 0.8),
-            1.8,
-        );
-    }
-}
-
-fn draw_wifi_icon(pixmap: &mut Pixmap, cx: f32, cy: f32, size: f32, color: ColorU8, phase: f32) {
+fn draw_wifi_icon(pixmap: &mut Pixmap, cx: f32, cy: f32, size: f32, color: ColorU8) {
     let center_y = cy + size * 0.22;
-    for (index, radius) in [size * 0.42, size * 0.29, size * 0.16]
-        .into_iter()
-        .enumerate()
-    {
-        let pulse = 0.62 + 0.38 * (0.5 + 0.5 * (phase * 5.0 - index as f32 * 0.9).sin());
+    for radius in [size * 0.42, size * 0.29, size * 0.16] {
         draw_arc(
             pixmap,
             cx,
@@ -364,7 +308,7 @@ fn draw_wifi_icon(pixmap: &mut Pixmap, cx: f32, cy: f32, size: f32, color: Color
             radius,
             205.0,
             335.0,
-            scale_alpha(color, pulse),
+            color,
             (size * 0.075).max(1.0),
         );
     }
@@ -532,9 +476,8 @@ fn draw_expanded(
         1.0 - view.mode_mix
     };
     let start = view.mode.toggle();
-    let label_mix = smoothstep(0.28, 0.72, to_target);
-    let out_alpha = alpha * (1.0 - label_mix);
-    let in_alpha = alpha * label_mix;
+    let out_alpha = alpha * (1.0 - smoothstep(0.10, 0.45, to_target));
+    let in_alpha = alpha * smoothstep(0.55, 0.90, to_target);
 
     let label_size = 10.0 * s;
     let label_baseline = geo.y + 34.0 * s;
@@ -991,4 +934,60 @@ fn blend_color(a: ColorU8, b: ColorU8, t: f32) -> ColorU8 {
         lerp(a.blue() as f32, b.blue() as f32, t) as u8,
         lerp(a.alpha() as f32, b.alpha() as f32, t) as u8,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn content_layers_never_overlap() {
+        for step in 0..=100 {
+            let t = step as f32 / 100.0;
+            for closing in [false, true] {
+                let alphas = content_alphas(t, t, closing);
+                assert!(
+                    alphas.collapsed <= 1e-6 || alphas.expanded <= 1e-6,
+                    "compact and expanded overlapped at {t} (closing: {closing})"
+                );
+                assert!(
+                    alphas.collapsed <= 1e-6 || alphas.notice <= 1e-6,
+                    "compact and notice overlapped at {t} (closing: {closing})"
+                );
+                assert!(
+                    alphas.expanded <= 1e-6 || alphas.notice <= 1e-6,
+                    "expanded and notice overlapped at {t} (closing: {closing})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compact_and_expanded_hand_off_at_midpoint() {
+        let alphas = content_alphas(0.5, 0.0, false);
+        assert!(alphas.collapsed <= 1e-6);
+        assert!(alphas.expanded <= 1e-6);
+    }
+
+    #[test]
+    fn notice_waits_for_compact_content_to_leave() {
+        let alphas = content_alphas(0.0, 0.32, false);
+        assert!(alphas.collapsed <= 1e-6);
+        assert!(alphas.notice <= 1e-6);
+    }
+
+    #[test]
+    fn notice_leaves_before_compact_content_returns() {
+        let leaving = content_alphas(0.0, 0.7, true);
+        assert!(leaving.collapsed <= 1e-6);
+        assert!((leaving.notice - 1.0).abs() < 1e-6);
+
+        let gone = content_alphas(0.0, 0.3, true);
+        assert!(gone.collapsed <= 1e-6);
+        assert!(gone.notice <= 1e-6);
+
+        let returning = content_alphas(0.0, 0.1, true);
+        assert!(returning.collapsed > 0.5);
+        assert!(returning.notice <= 1e-6);
+    }
 }

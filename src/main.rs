@@ -75,8 +75,12 @@ const WINDOW_CLASS: PCWSTR = w!("PoniIslandWindow");
 const WINDOW_TITLE: PCWSTR = w!("Poni");
 const HOTKEY_MODE: i32 = 1;
 const HOTKEY_QUIT: i32 = 2;
-const ANIMATION_RATE: f32 = 18.0;
-const MODE_RATE: f32 = 13.0;
+/// One shared rate for shape, mode, and notice motion so every layer settles
+/// together instead of racing each other.
+const MOTION_RATE: f32 = 16.0;
+const HOVER_INTENT: Duration = Duration::from_millis(140);
+const NOTICE_DURATION: Duration = Duration::from_secs(3);
+const NOTICE_QUICK_EXIT: Duration = Duration::from_millis(350);
 const TRAY_MESSAGE: u32 = WM_APP + 1;
 const TRAY_ID: u32 = 1;
 const CMD_NOTCH: usize = 100;
@@ -127,7 +131,6 @@ struct Notice {
     kind: NoticeKind,
     title: String,
     subtitle: String,
-    started: Instant,
     battery: Option<u8>,
     until: Instant,
 }
@@ -403,6 +406,7 @@ struct App {
     mode_mix: f32,
     progress: f32,
     hovered: bool,
+    hover_since: Option<Instant>,
     pinned: bool,
     scale: f32,
     shape_scale: f32,
@@ -420,6 +424,8 @@ struct App {
     network: NetworkState,
     network_initialized: bool,
     notice: Option<Notice>,
+    notice_closing: bool,
+    pending_notice: Option<Notice>,
     notice_mix: f32,
     hidden_for_fullscreen: bool,
     last_fullscreen_check: Instant,
@@ -438,6 +444,7 @@ impl App {
             mode_mix: mode.mix(),
             progress: 0.0,
             hovered: false,
+            hover_since: None,
             pinned: false,
             scale: 1.0,
             shape_scale: settings
@@ -457,6 +464,8 @@ impl App {
             network: NetworkState::default(),
             network_initialized: false,
             notice: None,
+            notice_closing: false,
+            pending_notice: None,
             notice_mix: 0.0,
             hidden_for_fullscreen: false,
             last_fullscreen_check: Instant::now(),
@@ -583,6 +592,7 @@ impl App {
             if fullscreen {
                 self.pinned = false;
                 self.hovered = false;
+                self.hover_since = None;
                 self.progress = 0.0;
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
             } else {
@@ -633,14 +643,30 @@ impl App {
             return;
         }
         let now = Instant::now();
-        self.notice = Some(Notice {
+        let notice = Notice {
             kind,
             title: title.to_string(),
             subtitle,
-            started: now,
             battery,
-            until: now + Duration::from_secs(3),
-        });
+            until: now + NOTICE_DURATION,
+        };
+
+        if self.notice.is_some() {
+            // Never swap text while a notice is fully visible. Queue the new
+            // one and let the current notice leave first.
+            self.pending_notice = Some(notice);
+            if !self.notice_closing {
+                if let Some(current) = self.notice.as_mut() {
+                    let quick = now + NOTICE_QUICK_EXIT;
+                    if current.until > quick {
+                        current.until = quick;
+                    }
+                }
+            }
+        } else {
+            self.notice = Some(notice);
+            self.notice_closing = false;
+        }
         self.request_frame();
     }
 
@@ -703,8 +729,21 @@ impl App {
             let _ = ScreenToClient(self.hwnd, &mut point);
             self.hovered = self.hit_test(point.x as f32, point.y as f32);
         }
+        if self.hovered && self.notice.is_none() {
+            self.hover_since.get_or_insert(now);
+        } else {
+            self.hover_since = None;
+        }
 
-        let target = if self.pinned || self.hovered {
+        // Wait out a short hover intent before expanding. Collapsing stays
+        // immediate so the island never lingers open after the pointer leaves.
+        let hover_ready = self
+            .hover_since
+            .is_some_and(|since| now.duration_since(since) >= HOVER_INTENT);
+        let notice_active = self.notice.is_some();
+        let target = if notice_active {
+            0.0
+        } else if self.pinned || hover_ready {
             1.0
         } else {
             0.0
@@ -717,25 +756,41 @@ impl App {
             self.time = clock;
             changed = true;
         }
-        if self
-            .notice
-            .as_ref()
-            .is_some_and(|notice| now >= notice.until)
+        if !self.notice_closing
+            && self
+                .notice
+                .as_ref()
+                .is_some_and(|notice| now >= notice.until)
         {
+            // Keep the notice content alive while the shape fades out.
+            self.notice_closing = true;
+            changed = true;
+        }
+        let notice_target = if notice_active && !self.notice_closing {
+            1.0
+        } else {
+            0.0
+        };
+        if approach(&mut self.progress, target, dt, MOTION_RATE) {
+            changed = true;
+        }
+        if approach(&mut self.mode_mix, target_mode, dt, MOTION_RATE) {
+            changed = true;
+        }
+        if approach(&mut self.notice_mix, notice_target, dt, MOTION_RATE) {
+            changed = true;
+        }
+
+        if self.notice_closing && self.notice_mix <= 0.001 {
+            self.notice_mix = 0.0;
             self.notice = None;
-        }
-        if self.notice.is_some() {
+            self.notice_closing = false;
             changed = true;
-        }
-        let notice_target = if self.notice.is_some() { 1.0 } else { 0.0 };
-        if approach(&mut self.progress, target, dt, ANIMATION_RATE) {
-            changed = true;
-        }
-        if approach(&mut self.mode_mix, target_mode, dt, MODE_RATE) {
-            changed = true;
-        }
-        if approach(&mut self.notice_mix, notice_target, dt, 22.0) {
-            changed = true;
+            if let Some(mut next) = self.pending_notice.take() {
+                next.until = Instant::now() + NOTICE_DURATION;
+                self.notice = Some(next);
+                self.request_frame();
+            }
         }
 
         if changed {
@@ -750,20 +805,29 @@ impl App {
     }
 
     fn next_interval_ms(&self) -> f32 {
-        let target = if self.pinned || self.hovered {
+        let target = if self.notice.is_some() {
+            0.0
+        } else if self.pinned
+            || self
+                .hover_since
+                .is_some_and(|since| since.elapsed() >= HOVER_INTENT)
+        {
             1.0
         } else {
             0.0
         };
-        let notice_target = if self.notice.is_some() { 1.0 } else { 0.0 };
-        let animating = self.notice.is_some()
-            || (self.progress - target).abs() > 0.002
+        let notice_target = if self.notice.is_some() && !self.notice_closing {
+            1.0
+        } else {
+            0.0
+        };
+        let animating = (self.progress - target).abs() > 0.002
             || (self.mode_mix - self.mode.mix()).abs() > 0.002
             || (self.notice_mix - notice_target).abs() > 0.002;
 
         if animating {
             1000.0 / self.refresh_hz.max(30.0)
-        } else if self.progress > 0.001 {
+        } else if self.progress > 0.001 || self.notice_mix > 0.001 {
             33.0
         } else {
             35.0
@@ -793,11 +857,7 @@ impl App {
             notice_title: self.notice.as_ref().map(|notice| notice.title.as_str()),
             notice_subtitle: self.notice.as_ref().map(|notice| notice.subtitle.as_str()),
             notice_battery: self.notice.as_ref().and_then(|notice| notice.battery),
-            notice_phase: self
-                .notice
-                .as_ref()
-                .map(|notice| notice.started.elapsed().as_secs_f32())
-                .unwrap_or(0.0),
+            notice_closing: self.notice_closing,
             regular: self.fonts.regular.as_ref(),
             semibold: self.fonts.semibold.as_ref(),
         };
