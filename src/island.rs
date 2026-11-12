@@ -13,6 +13,7 @@ const MUTED: ColorU8 = ColorU8::from_rgba(158, 157, 152, 205);
 #[allow(dead_code)]
 const HAIRLINE: ColorU8 = ColorU8::from_rgba(255, 255, 255, 10);
 const GREEN: ColorU8 = ColorU8::from_rgba(102, 224, 151, 255);
+const RED: ColorU8 = ColorU8::from_rgba(255, 99, 99, 255);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum NoticeKind {
@@ -156,8 +157,17 @@ fn draw_collapsed(pixmap: &mut Pixmap, view: &IslandView<'_>, alpha: f32) {
     let label = format!("{percent}%");
     let label_size = 10.0 * s;
     let label_width = measure_text(regular, &label, label_size);
+    let accent = if view.battery_charging {
+        GREEN
+    } else if percent <= 20 {
+        RED
+    } else {
+        TEXT
+    };
     let label_color = if view.battery_charging {
         scale_alpha(GREEN, alpha)
+    } else if percent <= 20 {
+        scale_alpha(RED, alpha)
     } else {
         scale_alpha(MUTED, alpha)
     };
@@ -178,8 +188,7 @@ fn draw_collapsed(pixmap: &mut Pixmap, view: &IslandView<'_>, alpha: f32) {
         percent,
         view.battery_charging,
         alpha,
-        TEXT,
-        GREEN,
+        accent,
     );
 }
 
@@ -221,8 +230,17 @@ fn draw_expanded(pixmap: &mut Pixmap, view: &IslandView<'_>, alpha: f32) {
         let label = format!("{percent}%");
         let label_size = 15.5 * s;
         let label_width = measure_text(semibold, &label, label_size);
+        let accent = if view.battery_charging {
+            GREEN
+        } else if percent <= 20 {
+            RED
+        } else {
+            TEXT
+        };
         let label_color = if view.battery_charging {
             scale_alpha(GREEN, alpha)
+        } else if percent <= 20 {
+            scale_alpha(RED, alpha)
         } else {
             scale_alpha(TEXT, alpha)
         };
@@ -243,21 +261,9 @@ fn draw_expanded(pixmap: &mut Pixmap, view: &IslandView<'_>, alpha: f32) {
             percent,
             view.battery_charging,
             alpha,
-            TEXT,
-            GREEN,
+            accent,
         );
     }
-
-    let divider_y = top + 82.0 * s;
-    draw_line(
-        pixmap,
-        left,
-        divider_y,
-        right,
-        divider_y,
-        scale_alpha(HAIRLINE, alpha),
-        1.0 * s,
-    );
 
     let baseline = top + 112.0 * s;
     let column_width = ((right - left) * 0.5 - 12.0 * s).max(0.0);
@@ -539,11 +545,9 @@ fn draw_battery(
     percent: u8,
     charging: bool,
     alpha: f32,
-    color: ColorU8,
-    charging_color: ColorU8,
+    accent: ColorU8,
 ) {
-    let accent = if charging { charging_color } else { color };
-    let track = scale_alpha(color, alpha * 0.28);
+    let track = scale_alpha(accent, alpha * 0.28);
     let track_width = (radius * 0.28).max(1.4);
     draw_arc(
         pixmap,
@@ -576,8 +580,8 @@ fn draw_battery(
             cx,
             cy + radius * 0.02,
             radius * 1.15,
-            scale_alpha(color, alpha),
-            scale_alpha(ColorU8::from_rgba(0, 0, 0, 255), alpha * 0.8),
+            scale_alpha(GREEN, alpha),
+            scale_alpha(ColorU8::from_rgba(0, 0, 0, 255), alpha * 0.85),
         );
     }
 }
