@@ -151,7 +151,7 @@ fn draw_collapsed(pixmap: &mut Pixmap, view: &IslandView<'_>, alpha: f32) {
 
     let radius = 6.2 * s;
     let icon_x = right - radius;
-    let icon_y = geo.y + geo.height / 2.0;
+    let icon_y = geo.y + geo.height / 2.0 + 0.8 * s;
     let label = format!("{percent}%");
     let label_size = 10.0 * s;
     let label_width = measure_text(regular, &label, label_size);
@@ -224,7 +224,7 @@ fn draw_expanded(pixmap: &mut Pixmap, view: &IslandView<'_>, alpha: f32) {
     if let Some(percent) = view.battery_percent {
         let radius = 8.2 * s;
         let icon_x = right - radius;
-        let icon_y = top + 31.0 * s;
+        let icon_y = top + 33.5 * s;
         let label = format!("{percent}%");
         let label_size = 15.5 * s;
         let label_width = measure_text(semibold, &label, label_size);
