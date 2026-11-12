@@ -40,14 +40,19 @@ pub fn draw(width: u32, height: u32, view: &IslandView<'_>) -> Option<Pixmap> {
         }
     }
 
-    let Some(path) = rounded_rect_path(
-        geo.x,
-        geo.y,
-        geo.width,
-        geo.height,
-        geo.top_radius,
-        geo.bottom_radius,
-    ) else {
+    let path = if view.mode == IslandMode::Notch {
+        notch_path(&geo)
+    } else {
+        rounded_rect_path(
+            geo.x,
+            geo.y,
+            geo.width,
+            geo.height,
+            geo.top_radius,
+            geo.bottom_radius,
+        )
+    };
+    let Some(path) = path else {
         return Some(pixmap);
     };
 
@@ -199,6 +204,43 @@ fn draw_content(pixmap: &mut Pixmap, view: &IslandView<'_>, font: &Font) {
         9.5 * s,
         muted,
     );
+}
+
+fn notch_path(geo: &Geometry) -> Option<Path> {
+    let x = geo.x;
+    let y = geo.y;
+    let width = geo.width;
+    let height = geo.height;
+    let flare = geo.notch_flare;
+    let shoulder = geo.notch_shoulder;
+    let radius = geo.bottom_radius.min(width / 2.0).min(height / 2.0);
+    let mut pb = PathBuilder::new();
+
+    pb.move_to(x - flare, y);
+    pb.line_to(x + width + flare, y);
+    pb.cubic_to(
+        x + width + flare,
+        y + shoulder * 0.56,
+        x + width,
+        y + shoulder * 0.18,
+        x + width,
+        y + shoulder,
+    );
+    pb.line_to(x + width, y + height - radius);
+    pb.quad_to(x + width, y + height, x + width - radius, y + height);
+    pb.line_to(x + radius, y + height);
+    pb.quad_to(x, y + height, x, y + height - radius);
+    pb.line_to(x, y + shoulder);
+    pb.cubic_to(
+        x,
+        y + shoulder * 0.18,
+        x - flare,
+        y + shoulder * 0.56,
+        x - flare,
+        y,
+    );
+    pb.close();
+    pb.finish()
 }
 
 fn rounded_rect_path(

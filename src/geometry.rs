@@ -52,6 +52,8 @@ pub struct Geometry {
     pub height: f32,
     pub top_radius: f32,
     pub bottom_radius: f32,
+    pub notch_flare: f32,
+    pub notch_shoulder: f32,
 }
 
 pub fn geometry(mode_mix: f32, progress: f32, scale: f32, window_width: f32) -> Geometry {
@@ -64,6 +66,9 @@ pub fn geometry(mode_mix: f32, progress: f32, scale: f32, window_width: f32) -> 
     let y = lerp(0.0, 10.0, mode_mix) * scale;
     let top_radius = lerp(0.0, 17.0, mode_mix) * scale;
     let bottom_radius = lerp(17.0, 26.0, progress) * scale;
+    let notch_mix = 1.0 - mode_mix;
+    let notch_flare = 12.0 * notch_mix * scale;
+    let notch_shoulder = 9.0 * notch_mix * scale;
 
     Geometry {
         x,
@@ -72,11 +77,22 @@ pub fn geometry(mode_mix: f32, progress: f32, scale: f32, window_width: f32) -> 
         height,
         top_radius: top_radius.min(height / 2.0),
         bottom_radius: bottom_radius.min(height / 2.0),
+        notch_flare,
+        notch_shoulder,
     }
 }
 
 impl Geometry {
     pub fn contains(&self, px: f32, py: f32) -> bool {
+        if self.notch_flare > 0.01
+            && py >= self.y
+            && py <= self.y + self.notch_shoulder
+            && px >= self.x - self.notch_flare
+            && px <= self.x + self.width + self.notch_flare
+        {
+            return true;
+        }
+
         if px < self.x || px > self.x + self.width || py < self.y || py > self.y + self.height {
             return false;
         }
@@ -127,7 +143,9 @@ mod tests {
         let geo = geometry(0.0, 0.0, 1.0, 500.0);
         assert_eq!(geo.y, 0.0);
         assert_eq!(geo.top_radius, 0.0);
+        assert!(geo.notch_flare > 0.0);
         assert!(geo.width < 500.0);
+        assert!(geo.contains(geo.x - geo.notch_flare + 1.0, 1.0));
     }
 
     #[test]
