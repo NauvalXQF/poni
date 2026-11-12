@@ -654,13 +654,14 @@ fn island_path(geo: &Geometry) -> Option<Path> {
     let drop = top_radius.max(shoulder).min(height / 2.0);
     let mut pb = PathBuilder::new();
 
+    let shoulder_k = 0.72;
     pb.move_to(top_edge_left, y);
     pb.line_to(top_edge_right, y);
     pb.cubic_to(
-        top_edge_right + (x + width - top_edge_right) * CORNER_K,
+        top_edge_right + (x + width - top_edge_right) * shoulder_k,
         y,
         x + width,
-        y + drop * (1.0 - CORNER_K),
+        y + drop * (1.0 - shoulder_k),
         x + width,
         y + drop,
     );
@@ -685,8 +686,8 @@ fn island_path(geo: &Geometry) -> Option<Path> {
     pb.line_to(x, y + drop);
     pb.cubic_to(
         x,
-        y + drop * (1.0 - CORNER_K),
-        top_edge_left + (x - top_edge_left) * CORNER_K,
+        y + drop * (1.0 - shoulder_k),
+        top_edge_left + (x - top_edge_left) * shoulder_k,
         y,
         top_edge_left,
         y,
