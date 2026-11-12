@@ -13,6 +13,7 @@ A native Windows notch/pill island. Built with Rust, tiny-skia, and the Win32 AP
 - `Ctrl+Alt+N` toggles Notch/Pill.
 - `Ctrl+Alt+Q` quits.
 - Transparent, always-on-top, no-activate window with click-through outside the island.
+- Hides automatically for fullscreen apps and returns when fullscreen ends.
 - DPI-aware and crisp on scaled displays.
 - Adaptive frame pacing: detects the monitor refresh rate and animates at
   120Hz or 60Hz without changing animation duration.
