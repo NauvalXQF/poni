@@ -16,15 +16,15 @@ use serde::{Deserialize, Serialize};
 use tiny_skia::Pixmap;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, BOOL, COLORREF, FILETIME, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, SIZE,
-    WAIT_OBJECT_0, WPARAM,
+    CloseHandle, BOOL, COLORREF, FILETIME, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT,
+    SIZE, WAIT_OBJECT_0, WPARAM,
 };
 use windows::Win32::Graphics::Dwm::{DwmGetCompositionTimingInfo, DWM_TIMING_INFO};
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, GetMonitorInfoW,
-    MonitorFromPoint, ReleaseDC, ScreenToClient, SelectObject, UpdateWindow, AC_SRC_ALPHA,
-    AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS, HDC, HGDIOBJ,
-    MONITORINFO, MONITOR_DEFAULTTOPRIMARY,
+    MonitorFromPoint, MonitorFromWindow, ReleaseDC, ScreenToClient, SelectObject, UpdateWindow,
+    AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS,
+    HDC, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
@@ -43,18 +43,20 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, UnregisterHotKey, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT,
 };
 use windows::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
+    SHQueryUserNotificationState, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD,
+    NIM_DELETE, NOTIFYICONDATAW, QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, GetCursorPos, GetWindowLongPtrW, LoadCursorW, LoadIconW,
-    MsgWaitForMultipleObjectsEx, PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW,
-    SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, TrackPopupMenu,
-    TranslateMessage, UpdateLayeredWindow, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA,
-    HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW, IDI_APPLICATION, MA_NOACTIVATE, MF_CHECKED,
-    MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT,
-    SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_SHOWNOACTIVATE, TPM_RETURNCMD, TPM_RIGHTBUTTON, ULW_ALPHA,
-    WM_APP, WM_CREATE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_HOTKEY, WM_LBUTTONUP,
+    DispatchMessageW, GetClassNameW, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW,
+    GetWindowRect, IsWindowVisible, IsZoomed, LoadCursorW, LoadIconW, MsgWaitForMultipleObjectsEx,
+    PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, TrackPopupMenu, TranslateMessage,
+    UpdateLayeredWindow, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HTCLIENT,
+    HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW, IDI_APPLICATION, MA_NOACTIVATE, MF_CHECKED, MF_POPUP,
+    MF_SEPARATOR, MF_STRING, MSG, MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT, SWP_NOACTIVATE,
+    SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNOACTIVATE, TPM_RETURNCMD, TPM_RIGHTBUTTON, ULW_ALPHA, WM_APP,
+    WM_CREATE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_HOTKEY, WM_LBUTTONUP,
     WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_NULL, WM_QUIT,
     WM_RBUTTONUP, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_POPUP,
@@ -165,6 +167,59 @@ fn filetime_value(time: FILETIME) -> u64 {
     ((time.dwHighDateTime as u64) << 32) | time.dwLowDateTime as u64
 }
 
+unsafe fn foreground_is_fullscreen(our_hwnd: HWND) -> bool {
+    if let Ok(state) = SHQueryUserNotificationState() {
+        if [
+            QUNS_BUSY.0,
+            QUNS_PRESENTATION_MODE.0,
+            QUNS_RUNNING_D3D_FULL_SCREEN.0,
+        ]
+        .contains(&state.0)
+        {
+            return true;
+        }
+    }
+
+    let foreground = GetForegroundWindow();
+    if foreground.0.is_null()
+        || foreground == our_hwnd
+        || !IsWindowVisible(foreground).as_bool()
+        || IsZoomed(foreground).as_bool()
+    {
+        return false;
+    }
+
+    let mut class_buffer = [0u16; 64];
+    let class_len = GetClassNameW(foreground, &mut class_buffer);
+    if class_len > 0 {
+        let class_name = String::from_utf16_lossy(&class_buffer[..class_len as usize]);
+        if matches!(class_name.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd") {
+            return false;
+        }
+    }
+
+    let mut rect = RECT::default();
+    if GetWindowRect(foreground, &mut rect).is_err() {
+        return false;
+    }
+
+    let monitor = MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST);
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+        return false;
+    }
+
+    let screen = info.rcMonitor;
+    let tolerance = 2;
+    rect.left <= screen.left + tolerance
+        && rect.top <= screen.top + tolerance
+        && rect.right >= screen.right - tolerance
+        && rect.bottom >= screen.bottom - tolerance
+}
+
 fn battery_status() -> BatteryStatus {
     let mut status = SYSTEM_POWER_STATUS::default();
     if unsafe { GetSystemPowerStatus(&mut status) }.is_err() {
@@ -204,6 +259,8 @@ struct App {
     battery: BatteryStatus,
     cpu_sampler: CpuSampler,
     last_status_update: Instant,
+    hidden_for_fullscreen: bool,
+    last_fullscreen_check: Instant,
     timer: HANDLE,
     refresh_hz: f32,
     last_tick: Instant,
@@ -235,6 +292,8 @@ impl App {
             battery: BatteryStatus::default(),
             cpu_sampler: CpuSampler::default(),
             last_status_update: Instant::now(),
+            hidden_for_fullscreen: false,
+            last_fullscreen_check: Instant::now(),
             timer,
             refresh_hz: detect_refresh_rate(),
             last_tick: Instant::now(),
@@ -247,6 +306,7 @@ impl App {
         self.refresh_hz = detect_refresh_rate();
         self.update_system_status(true);
         self.resize_window();
+        self.update_fullscreen_visibility(true);
         log_line(&format!("Poni started at {:.1} Hz", self.refresh_hz));
 
         let _ = RegisterHotKey(
@@ -302,6 +362,10 @@ impl App {
             monitor_rect.left + (monitor_rect.right - monitor_rect.left - self.window_width) / 2;
         let y = monitor_rect.top;
 
+        let mut flags = SWP_NOACTIVATE;
+        if !self.hidden_for_fullscreen {
+            flags |= SWP_SHOWWINDOW;
+        }
         let _ = SetWindowPos(
             self.hwnd,
             HWND_TOPMOST,
@@ -309,9 +373,11 @@ impl App {
             y,
             self.window_width,
             self.window_height,
-            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            flags,
         );
-        let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+        if !self.hidden_for_fullscreen {
+            let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+        }
     }
 
     fn geometry(&self) -> geometry::Geometry {
@@ -331,6 +397,33 @@ impl App {
         }
         let index = y as usize * self.window_width as usize + x as usize;
         self.hit_mask.get(index).copied().unwrap_or(0) > 127
+    }
+
+    fn update_fullscreen_visibility(&mut self, force: bool) {
+        let now = Instant::now();
+        if !force && now.duration_since(self.last_fullscreen_check) < Duration::from_millis(500) {
+            return;
+        }
+        self.last_fullscreen_check = now;
+
+        let fullscreen = unsafe { foreground_is_fullscreen(self.hwnd) };
+        if fullscreen == self.hidden_for_fullscreen {
+            return;
+        }
+
+        self.hidden_for_fullscreen = fullscreen;
+        unsafe {
+            if fullscreen {
+                self.pinned = false;
+                self.hovered = false;
+                self.progress = 0.0;
+                let _ = ShowWindow(self.hwnd, SW_HIDE);
+            } else {
+                let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+                self.redraw();
+                self.request_frame();
+            }
+        }
     }
 
     fn update_system_status(&mut self, force: bool) -> bool {
@@ -364,6 +457,7 @@ impl App {
             .as_secs_f32()
             .clamp(0.001, 0.05);
         self.last_tick = now;
+        self.update_fullscreen_visibility(false);
 
         let mut point = POINT::default();
         if GetCursorPos(&mut point).is_ok() {
@@ -421,6 +515,9 @@ impl App {
     }
 
     fn redraw(&mut self) {
+        if self.hidden_for_fullscreen {
+            return;
+        }
         let Some(surface) = self.surface.take() else {
             return;
         };
