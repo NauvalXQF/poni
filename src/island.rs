@@ -133,7 +133,7 @@ fn draw_collapsed(pixmap: &mut Pixmap, view: &IslandView<'_>, alpha: f32) {
     let geo = view.geometry;
     let left = geo.x + 18.0 * s;
     let right = geo.x + geo.width - 18.0 * s;
-    let baseline = geo.y + geo.height / 2.0 + 4.5 * s;
+    let baseline = geo.y + geo.height / 2.0 + 5.5 * s;
 
     draw_text(
         pixmap,
@@ -141,7 +141,7 @@ fn draw_collapsed(pixmap: &mut Pixmap, view: &IslandView<'_>, alpha: f32) {
         &view.time,
         left,
         baseline,
-        13.5 * s,
+        15.5 * s,
         scale_alpha(TEXT, alpha),
     );
 
@@ -149,11 +149,11 @@ fn draw_collapsed(pixmap: &mut Pixmap, view: &IslandView<'_>, alpha: f32) {
         return;
     };
 
-    let radius = 6.2 * s;
+    let radius = 7.2 * s;
     let icon_x = right - radius;
-    let icon_y = geo.y + geo.height / 2.0 + 0.8 * s;
+    let icon_y = geo.y + geo.height / 2.0 + 0.5 * s;
     let label = format!("{percent}%");
-    let label_size = 10.0 * s;
+    let label_size = 11.5 * s;
     let label_width = measure_text(regular, &label, label_size);
     let accent = if view.battery_charging {
         GREEN
@@ -173,8 +173,8 @@ fn draw_collapsed(pixmap: &mut Pixmap, view: &IslandView<'_>, alpha: f32) {
         pixmap,
         regular,
         &label,
-        icon_x - radius - 6.0 * s - label_width,
-        baseline - 0.5 * s,
+        icon_x - radius - 7.0 * s - label_width,
+        baseline,
         label_size,
         label_color,
     );
