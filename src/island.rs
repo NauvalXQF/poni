@@ -1,9 +1,16 @@
 use fontdue::Font;
-use tiny_skia::{Color, ColorU8, FillRule, Paint, Path, PathBuilder, Pixmap, Stroke, Transform};
+use tiny_skia::{
+    Color, ColorU8, FillRule, LineCap, LineJoin, Paint, Path, PathBuilder, Pixmap, Stroke,
+    Transform,
+};
 
-use crate::geometry::{lerp, Geometry, IslandMode};
+use crate::geometry::Geometry;
 
-const CORNER_K: f32 = 0.552_284_8;
+const CORNER_K: f32 = 0.58;
+const SURFACE: ColorU8 = ColorU8::from_rgba(9, 10, 13, 252);
+const TEXT: ColorU8 = ColorU8::from_rgba(245, 244, 240, 250);
+const MUTED: ColorU8 = ColorU8::from_rgba(158, 157, 152, 205);
+const HAIRLINE: ColorU8 = ColorU8::from_rgba(255, 255, 255, 14);
 const GREEN: ColorU8 = ColorU8::from_rgba(102, 224, 151, 255);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -14,15 +21,15 @@ pub enum NoticeKind {
 }
 
 pub struct IslandView<'a> {
-    pub mode: IslandMode,
-    pub mode_mix: f32,
     pub progress: f32,
     pub geometry: Geometry,
     pub scale: f32,
-    pub pinned: bool,
     pub time: String,
+    pub date: String,
     pub battery_percent: Option<u8>,
     pub battery_charging: bool,
+    pub wifi: Option<&'a str>,
+    pub bluetooth: Option<&'a str>,
     pub notice_mix: f32,
     pub notice_kind: Option<NoticeKind>,
     pub notice_title: Option<&'a str>,
@@ -37,9 +44,8 @@ pub fn draw(width: u32, height: u32, view: &IslandView<'_>) -> Option<Pixmap> {
     let mut shape = Pixmap::new(width, height)?;
     draw_shape(&mut shape, view);
 
-    // Content is rendered into its own layer so it can be clipped to the
-    // shape. Without this, expanded text briefly floats outside the island
-    // while the shape is still growing.
+    // Content renders into its own layer so it can be clipped to the capsule
+    // while the shape grows.
     let mut content = Pixmap::new(width, height)?;
     draw_content(&mut content, view);
     clip_to_shape(&mut content, &shape, 128);
@@ -50,52 +56,33 @@ pub fn draw(width: u32, height: u32, view: &IslandView<'_>) -> Option<Pixmap> {
 
 fn draw_shape(pixmap: &mut Pixmap, view: &IslandView<'_>) {
     let geo = view.geometry;
-
-    if view.mode_mix > 0.01 {
-        let mut shadow_geo = geo;
-        shadow_geo.x -= 1.0 * view.scale;
-        shadow_geo.y += 4.0 * view.scale;
-        shadow_geo.width += 2.0 * view.scale;
-        if let Some(shadow) = island_path(&shadow_geo, view.mode_mix) {
-            let mut paint = Paint::default();
-            paint.set_color_rgba8(0, 0, 0, (58.0 * view.mode_mix) as u8);
-            pixmap.fill_path(
-                &shadow,
-                &paint,
-                FillRule::Winding,
-                Transform::identity(),
-                None,
-            );
-        }
-    }
-
-    let Some(path) = island_path(&geo, view.mode_mix) else {
+    let Some(path) = rounded_rect_path(geo.x, geo.y, geo.width, geo.height, geo.radius) else {
         return;
     };
 
     let mut fill = Paint::default();
-    let bg = blend_color(
-        ColorU8::from_rgba(0, 0, 0, 255),
-        ColorU8::from_rgba(8, 9, 12, 252),
-        view.mode_mix,
-    );
     fill.set_color(Color::from_rgba8(
-        bg.red(),
-        bg.green(),
-        bg.blue(),
-        bg.alpha(),
+        SURFACE.red(),
+        SURFACE.green(),
+        SURFACE.blue(),
+        SURFACE.alpha(),
     ));
     pixmap.fill_path(&path, &fill, FillRule::Winding, Transform::identity(), None);
 
-    if view.mode_mix > 0.02 {
-        let mut border = Paint::default();
-        border.set_color_rgba8(255, 178, 36, (38.0 * view.mode_mix) as u8);
-        let stroke = Stroke {
-            width: 1.0 * view.scale,
-            ..Default::default()
-        };
-        pixmap.stroke_path(&path, &border, &stroke, Transform::identity(), None);
-    }
+    // A hairline keeps the capsule legible on light wallpapers without the
+    // hard offset shadow the old HUD used.
+    let mut border = Paint::default();
+    border.set_color(Color::from_rgba8(
+        HAIRLINE.red(),
+        HAIRLINE.green(),
+        HAIRLINE.blue(),
+        HAIRLINE.alpha(),
+    ));
+    let stroke = Stroke {
+        width: 1.0 * view.scale,
+        ..Default::default()
+    };
+    pixmap.stroke_path(&path, &border, &stroke, Transform::identity(), None);
 }
 
 fn draw_content(pixmap: &mut Pixmap, view: &IslandView<'_>) {
@@ -103,19 +90,16 @@ fn draw_content(pixmap: &mut Pixmap, view: &IslandView<'_>) {
         return;
     }
 
-    let accent = ColorU8::from_rgba(255, 178, 36, 255);
-    let cream = ColorU8::from_rgba(245, 241, 232, 245);
-    let muted = ColorU8::from_rgba(190, 184, 174, 185);
     let alphas = content_alphas(view.progress, view.notice_mix, view.notice_closing);
 
     if alphas.collapsed > 0.01 {
-        draw_collapsed(pixmap, view, alphas.collapsed, cream, muted);
+        draw_collapsed(pixmap, view, alphas.collapsed);
     }
     if alphas.expanded > 0.01 {
-        draw_expanded(pixmap, view, alphas.expanded, accent, cream, muted);
+        draw_expanded(pixmap, view, alphas.expanded);
     }
     if alphas.notice > 0.01 && view.notice_kind.is_some() {
-        draw_notice(pixmap, view, alphas.notice, cream, muted);
+        draw_notice(pixmap, view, alphas.notice);
     }
 }
 
@@ -151,13 +135,7 @@ fn content_alphas(progress: f32, notice_mix: f32, notice_closing: bool) -> Conte
     }
 }
 
-fn draw_collapsed(
-    pixmap: &mut Pixmap,
-    view: &IslandView<'_>,
-    alpha: f32,
-    cream: ColorU8,
-    muted: ColorU8,
-) {
+fn draw_collapsed(pixmap: &mut Pixmap, view: &IslandView<'_>, alpha: f32) {
     let Some(regular) = view.regular.or(view.semibold) else {
         return;
     };
@@ -169,15 +147,14 @@ fn draw_collapsed(
     let right = geo.x + geo.width - 18.0 * s;
     let baseline = geo.y + geo.height / 2.0 + 4.5 * s;
 
-    let time_size = 13.5 * s;
     draw_text(
         pixmap,
         semibold,
         &view.time,
         left,
         baseline,
-        time_size,
-        scale_alpha(cream, alpha),
+        13.5 * s,
+        scale_alpha(TEXT, alpha),
     );
 
     let Some(percent) = view.battery_percent else {
@@ -195,7 +172,7 @@ fn draw_collapsed(
     let label_color = if view.battery_charging {
         scale_alpha(GREEN, alpha)
     } else {
-        scale_alpha(muted, alpha)
+        scale_alpha(MUTED, alpha)
     };
     draw_text(
         pixmap,
@@ -216,18 +193,140 @@ fn draw_collapsed(
         percent,
         view.battery_charging,
         alpha,
-        cream,
+        TEXT,
         GREEN,
     );
 }
 
-fn draw_notice(
-    pixmap: &mut Pixmap,
-    view: &IslandView<'_>,
-    alpha: f32,
-    cream: ColorU8,
-    muted: ColorU8,
-) {
+fn draw_expanded(pixmap: &mut Pixmap, view: &IslandView<'_>, alpha: f32) {
+    let Some(regular) = view.regular.or(view.semibold) else {
+        return;
+    };
+    let semibold = view.semibold.unwrap_or(regular);
+
+    let s = view.scale;
+    let geo = view.geometry;
+    let left = geo.x + 28.0 * s;
+    let right = geo.x + geo.width - 28.0 * s;
+    let top = geo.y;
+
+    draw_text(
+        pixmap,
+        semibold,
+        &view.time,
+        left,
+        top + 46.0 * s,
+        31.0 * s,
+        scale_alpha(TEXT, alpha),
+    );
+    draw_text(
+        pixmap,
+        regular,
+        &view.date,
+        left,
+        top + 66.0 * s,
+        11.5 * s,
+        scale_alpha(MUTED, alpha),
+    );
+
+    if let Some(percent) = view.battery_percent {
+        let icon_width = 38.0 * s;
+        let icon_height = 17.0 * s;
+        let icon_x = right - icon_width;
+        let icon_y = top + 23.0 * s;
+        let label = format!("{percent}%");
+        let label_size = 15.5 * s;
+        let label_width = measure_text(semibold, &label, label_size);
+        let label_color = if view.battery_charging {
+            scale_alpha(GREEN, alpha)
+        } else {
+            scale_alpha(TEXT, alpha)
+        };
+        draw_text(
+            pixmap,
+            semibold,
+            &label,
+            icon_x - 9.0 * s - label_width,
+            top + 39.0 * s,
+            label_size,
+            label_color,
+        );
+        draw_battery(
+            pixmap,
+            icon_x,
+            icon_y,
+            icon_width,
+            icon_height,
+            percent,
+            view.battery_charging,
+            alpha,
+            TEXT,
+            GREEN,
+        );
+    }
+
+    let divider_y = top + 82.0 * s;
+    draw_line(
+        pixmap,
+        left,
+        divider_y,
+        right,
+        divider_y,
+        scale_alpha(HAIRLINE, alpha),
+        1.0 * s,
+    );
+
+    let baseline = top + 112.0 * s;
+    let column_width = ((right - left) * 0.5 - 12.0 * s).max(0.0);
+
+    let wifi = view.wifi.unwrap_or("Wi-Fi off");
+    let wifi_color = if view.wifi.is_some() { TEXT } else { MUTED };
+    draw_wifi_icon(
+        pixmap,
+        left + 6.5 * s,
+        baseline - 4.5 * s,
+        13.0 * s,
+        scale_alpha(wifi_color, alpha),
+    );
+    let wifi_label = elide(regular, wifi, 10.5 * s, column_width - 18.0 * s);
+    draw_text(
+        pixmap,
+        regular,
+        &wifi_label,
+        left + 17.0 * s,
+        baseline,
+        10.5 * s,
+        scale_alpha(wifi_color, alpha),
+    );
+
+    let bluetooth = view.bluetooth.unwrap_or("Bluetooth off");
+    let bluetooth_color = if view.bluetooth.is_some() {
+        TEXT
+    } else {
+        MUTED
+    };
+    let bluetooth_label = elide(regular, bluetooth, 10.5 * s, column_width - 20.0 * s);
+    let bluetooth_width = measure_text(regular, &bluetooth_label, 10.5 * s);
+    let icon_cx = right - 6.5 * s;
+    draw_text(
+        pixmap,
+        regular,
+        &bluetooth_label,
+        icon_cx - 11.0 * s - bluetooth_width,
+        baseline,
+        10.5 * s,
+        scale_alpha(bluetooth_color, alpha),
+    );
+    draw_bluetooth_icon(
+        pixmap,
+        icon_cx,
+        baseline - 4.5 * s,
+        13.0 * s,
+        scale_alpha(bluetooth_color, alpha),
+    );
+}
+
+fn draw_notice(pixmap: &mut Pixmap, view: &IslandView<'_>, alpha: f32) {
     let (Some(kind), Some(title), Some(subtitle)) =
         (view.notice_kind, view.notice_title, view.notice_subtitle)
     else {
@@ -239,36 +338,36 @@ fn draw_notice(
     let semibold = view.semibold.unwrap_or(regular);
     let s = view.scale;
     let geo = view.geometry;
-    let icon_x = geo.x + 27.0 * s;
+    let icon_x = geo.x + 24.0 * s;
     let center_y = geo.y + geo.height / 2.0;
-    let icon_color = scale_alpha(cream, alpha);
+    let icon_color = scale_alpha(TEXT, alpha);
 
     draw_filled_circle(
         pixmap,
         icon_x,
         center_y,
-        17.0 * s,
+        15.0 * s,
         ColorU8::from_rgba(255, 255, 255, (12.0 * alpha) as u8),
     );
-    draw_notice_icon(pixmap, kind, icon_x, center_y, 20.0 * s, icon_color);
+    draw_notice_icon(pixmap, kind, icon_x, center_y, 18.0 * s, icon_color);
 
     draw_text(
         pixmap,
         semibold,
         title,
-        geo.x + 54.0 * s,
-        geo.y + 26.0 * s,
-        12.5 * s,
-        scale_alpha(cream, alpha),
+        geo.x + 46.0 * s,
+        geo.y + 23.0 * s,
+        11.5 * s,
+        scale_alpha(TEXT, alpha),
     );
     draw_text(
         pixmap,
         regular,
         subtitle,
-        geo.x + 54.0 * s,
-        geo.y + 45.0 * s,
-        10.5 * s,
-        scale_alpha(muted, alpha),
+        geo.x + 46.0 * s,
+        geo.y + 39.0 * s,
+        10.0 * s,
+        scale_alpha(MUTED, alpha),
     );
 
     if kind == NoticeKind::Bluetooth {
@@ -280,10 +379,10 @@ fn draw_notice(
                 pixmap,
                 semibold,
                 &label,
-                geo.x + geo.width - 20.0 * s - label_width,
-                geo.y + 27.0 * s,
+                geo.x + geo.width - 18.0 * s - label_width,
+                geo.y + 23.0 * s,
                 label_size,
-                scale_alpha(cream, alpha),
+                scale_alpha(TEXT, alpha),
             );
         }
     }
@@ -315,7 +414,7 @@ fn draw_wifi_icon(pixmap: &mut Pixmap, cx: f32, cy: f32, size: f32, color: Color
             205.0,
             335.0,
             color,
-            (size * 0.075).max(1.0),
+            (size * 0.08).max(1.2),
         );
     }
     draw_filled_circle(pixmap, cx, center_y, size * 0.055, color);
@@ -341,7 +440,9 @@ fn draw_bluetooth_icon(pixmap: &mut Pixmap, cx: f32, cy: f32, size: f32, color: 
             color.alpha(),
         ));
         let stroke = Stroke {
-            width: (size * 0.075).max(1.0),
+            width: (size * 0.08).max(1.2),
+            line_cap: LineCap::Round,
+            line_join: LineJoin::Round,
             ..Default::default()
         };
         pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
@@ -396,7 +497,7 @@ fn draw_arc(
     width: f32,
 ) {
     let mut pb = PathBuilder::new();
-    let steps = 16;
+    let steps = 20;
     for step in 0..=steps {
         let t = step as f32 / steps as f32;
         let angle = (start_deg + (end_deg - start_deg) * t).to_radians();
@@ -418,6 +519,8 @@ fn draw_arc(
         ));
         let stroke = Stroke {
             width,
+            line_cap: LineCap::Round,
+            line_join: LineJoin::Round,
             ..Default::default()
         };
         pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
@@ -445,206 +548,6 @@ fn draw_filled_circle(pixmap: &mut Pixmap, cx: f32, cy: f32, radius: f32, color:
     }
 }
 
-fn draw_expanded(
-    pixmap: &mut Pixmap,
-    view: &IslandView<'_>,
-    alpha: f32,
-    accent: ColorU8,
-    cream: ColorU8,
-    muted: ColorU8,
-) {
-    let Some(regular) = view.regular.or(view.semibold) else {
-        return;
-    };
-    let semibold = view.semibold.unwrap_or(regular);
-
-    let s = view.scale;
-    let geo = view.geometry;
-    let left = geo.x + 24.0 * s;
-    let right = geo.x + geo.width - 24.0 * s;
-
-    draw_text(
-        pixmap,
-        semibold,
-        "Poni",
-        left,
-        geo.y + 36.0 * s,
-        20.0 * s,
-        scale_alpha(cream, alpha),
-    );
-
-    // The target mode is already selected when the toggle happens, so fade
-    // the previous label/subtitle out and the new one in as mode_mix settles.
-    let target_mix = view.mode.mix();
-    let to_target = if target_mix > 0.5 {
-        view.mode_mix
-    } else {
-        1.0 - view.mode_mix
-    };
-    let start = view.mode.toggle();
-    let out_alpha = alpha * (1.0 - smoothstep(0.10, 0.45, to_target));
-    let in_alpha = alpha * smoothstep(0.55, 0.90, to_target);
-
-    let label_size = 10.0 * s;
-    let label_baseline = geo.y + 34.0 * s;
-    if out_alpha > 0.01 {
-        let label = start.label();
-        let width = measure_text(semibold, label, label_size);
-        draw_text(
-            pixmap,
-            semibold,
-            label,
-            right - width,
-            label_baseline,
-            label_size,
-            scale_alpha(accent, out_alpha),
-        );
-    }
-    if in_alpha > 0.01 {
-        let label = view.mode.label();
-        let width = measure_text(semibold, label, label_size);
-        draw_text(
-            pixmap,
-            semibold,
-            label,
-            right - width,
-            label_baseline,
-            label_size,
-            scale_alpha(accent, in_alpha),
-        );
-    }
-
-    let subtitle_size = 12.0 * s;
-    let subtitle_baseline = geo.y + 60.0 * s;
-    if out_alpha > 0.01 {
-        draw_text(
-            pixmap,
-            regular,
-            start.subtitle(),
-            left,
-            subtitle_baseline,
-            subtitle_size,
-            scale_alpha(muted, out_alpha),
-        );
-    }
-    if in_alpha > 0.01 {
-        draw_text(
-            pixmap,
-            regular,
-            view.mode.subtitle(),
-            left,
-            subtitle_baseline,
-            subtitle_size,
-            scale_alpha(muted, in_alpha),
-        );
-    }
-
-    let divider_y = geo.y + 82.0 * s;
-    draw_line(
-        pixmap,
-        left,
-        divider_y,
-        right,
-        divider_y,
-        scale_alpha(ColorU8::from_rgba(255, 178, 36, 28), alpha),
-        1.0 * s,
-    );
-
-    draw_text(
-        pixmap,
-        regular,
-        "Two shapes. One quiet island.",
-        left,
-        geo.y + 112.0 * s,
-        13.0 * s,
-        scale_alpha(cream, alpha),
-    );
-
-    let hint = if view.pinned {
-        "Pinned. Left-click to release."
-    } else {
-        "Hover · right-click to switch shape"
-    };
-    draw_text(
-        pixmap,
-        regular,
-        hint,
-        left,
-        geo.y + 138.0 * s,
-        11.0 * s,
-        scale_alpha(muted, alpha),
-    );
-
-    draw_text(
-        pixmap,
-        regular,
-        "Ctrl+Alt+N  shape   ·   Ctrl+Alt+Q  quit",
-        left,
-        geo.y + 160.0 * s,
-        10.5 * s,
-        scale_alpha(muted, alpha),
-    );
-}
-
-fn island_path(geo: &Geometry, mode_mix: f32) -> Option<Path> {
-    let x = geo.x;
-    let y = geo.y;
-    let width = geo.width;
-    let height = geo.height;
-    let top_radius = geo.top_radius.min(width / 2.0).min(height / 2.0);
-    let bottom_radius = geo.bottom_radius.min(width / 2.0).min(height / 2.0);
-    let flare = geo.notch_flare.min(width / 2.0);
-    let shoulder = geo.notch_shoulder.min(height / 2.0);
-
-    // The lip and the rounded pill corner share one continuous corner curve.
-    // As the mode mix grows, the lip collapses (flare -> 0) while the corner
-    // radius opens up, so there is no topology swap and no visible pop.
-    let top_edge_left = x - flare + top_radius;
-    let top_edge_right = x + width + flare - top_radius;
-    let drop = lerp(shoulder, top_radius, mode_mix.clamp(0.0, 1.0));
-    let mut pb = PathBuilder::new();
-
-    pb.move_to(top_edge_left, y);
-    pb.line_to(top_edge_right, y);
-    pb.cubic_to(
-        top_edge_right + (x + width - top_edge_right) * CORNER_K,
-        y,
-        x + width,
-        y + drop * (1.0 - CORNER_K),
-        x + width,
-        y + drop,
-    );
-    pb.line_to(x + width, y + height - bottom_radius);
-    pb.cubic_to(
-        x + width,
-        y + height - bottom_radius + bottom_radius * CORNER_K,
-        x + width - bottom_radius + bottom_radius * CORNER_K,
-        y + height,
-        x + width - bottom_radius,
-        y + height,
-    );
-    pb.line_to(x + bottom_radius, y + height);
-    pb.cubic_to(
-        x + bottom_radius - bottom_radius * CORNER_K,
-        y + height,
-        x,
-        y + height - bottom_radius + bottom_radius * CORNER_K,
-        x,
-        y + height - bottom_radius,
-    );
-    pb.line_to(x, y + drop);
-    pb.cubic_to(
-        x,
-        y + drop * (1.0 - CORNER_K),
-        top_edge_left + (x - top_edge_left) * CORNER_K,
-        y,
-        top_edge_left,
-        y,
-    );
-    pb.close();
-    pb.finish()
-}
-
 fn draw_battery(
     pixmap: &mut Pixmap,
     x: f32,
@@ -668,8 +571,6 @@ fn draw_battery(
     };
     let accent = if charging { charging_color } else { color };
 
-    // The empty well is a faint wash of white so the level fill reads even
-    // against the near-black capsule.
     let mut well = Paint::default();
     well.set_color_rgba8(255, 255, 255, (10.0 * alpha) as u8);
     pixmap.fill_path(&body, &well, FillRule::Winding, Transform::identity(), None);
@@ -713,6 +614,7 @@ fn draw_battery(
     ));
     let stroke = Stroke {
         width: (1.15 * s).max(1.0),
+        line_join: LineJoin::Round,
         ..Default::default()
     };
     pixmap.stroke_path(&body, &outline, &stroke, Transform::identity(), None);
@@ -742,7 +644,7 @@ fn draw_battery(
             y + height / 2.0,
             height * 0.58,
             scale_alpha(color, alpha),
-            scale_alpha(ColorU8::from_rgba(8, 9, 12, 255), alpha * 0.7),
+            scale_alpha(ColorU8::from_rgba(9, 10, 13, 255), alpha * 0.7),
         );
     }
 }
@@ -768,6 +670,8 @@ fn draw_bolt(pixmap: &mut Pixmap, cx: f32, cy: f32, height: f32, color: ColorU8,
     ));
     let outline_stroke = Stroke {
         width: (height * 0.26).max(1.8),
+        line_cap: LineCap::Round,
+        line_join: LineJoin::Round,
         ..Default::default()
     };
     pixmap.stroke_path(
@@ -787,6 +691,8 @@ fn draw_bolt(pixmap: &mut Pixmap, cx: f32, cy: f32, height: f32, color: ColorU8,
     ));
     let stroke = Stroke {
         width: (height * 0.14).max(1.0),
+        line_cap: LineCap::Round,
+        line_join: LineJoin::Round,
         ..Default::default()
     };
     pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
@@ -802,31 +708,45 @@ fn bolt_path(cx: f32, cy: f32, height: f32) -> Option<Path> {
 }
 
 fn rounded_rect_path(x: f32, y: f32, width: f32, height: f32, radius: f32) -> Option<Path> {
+    if width <= 0.0 || height <= 0.0 {
+        return None;
+    }
     let radius = radius.min(width / 2.0).min(height / 2.0);
+    let k = radius * CORNER_K;
+    let right = x + width;
+    let bottom = y + height;
     let mut pb = PathBuilder::new();
+
     pb.move_to(x + radius, y);
-    pb.line_to(x + width - radius, y);
-    if radius > 0.01 {
-        pb.quad_to(x + width, y, x + width, y + radius);
-    } else {
-        pb.line_to(x + width, y);
-    }
-    pb.line_to(x + width, y + height - radius);
-    if radius > 0.01 {
-        pb.quad_to(x + width, y + height, x + width - radius, y + height);
-    } else {
-        pb.line_to(x + width, y + height);
-    }
-    pb.line_to(x + radius, y + height);
-    if radius > 0.01 {
-        pb.quad_to(x, y + height, x, y + height - radius);
-    } else {
-        pb.line_to(x, y + height);
-    }
+    pb.line_to(right - radius, y);
+    pb.cubic_to(
+        right - radius + k,
+        y,
+        right,
+        y + radius - k,
+        right,
+        y + radius,
+    );
+    pb.line_to(right, bottom - radius);
+    pb.cubic_to(
+        right,
+        bottom - radius + k,
+        right - radius + k,
+        bottom,
+        right - radius,
+        bottom,
+    );
+    pb.line_to(x + radius, bottom);
+    pb.cubic_to(
+        x + radius - k,
+        bottom,
+        x,
+        bottom - radius + k,
+        x,
+        bottom - radius,
+    );
     pb.line_to(x, y + radius);
-    if radius > 0.01 {
-        pb.quad_to(x, y, x + radius, y);
-    }
+    pb.cubic_to(x, y + radius - k, x + radius - k, y, x + radius, y);
     pb.close();
     pb.finish()
 }
@@ -845,10 +765,39 @@ fn draw_line(pixmap: &mut Pixmap, x1: f32, y1: f32, x2: f32, y2: f32, color: Col
         ));
         let stroke = Stroke {
             width,
+            line_cap: LineCap::Round,
             ..Default::default()
         };
         pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
     }
+}
+
+fn elide(font: &Font, text: &str, size: f32, max_width: f32) -> String {
+    if max_width <= 0.0 {
+        return String::new();
+    }
+    if measure_text(font, text, size) <= max_width {
+        return text.to_string();
+    }
+
+    let ellipsis = "…";
+    let ellipsis_width = measure_text(font, ellipsis, size);
+    if ellipsis_width >= max_width {
+        return String::new();
+    }
+
+    let mut result = String::new();
+    let mut width = 0.0;
+    for ch in text.chars() {
+        let advance = font.metrics(ch, size).advance_width;
+        if width + advance + ellipsis_width > max_width {
+            break;
+        }
+        result.push(ch);
+        width += advance;
+    }
+    result.push('…');
+    result
 }
 
 pub fn measure_text(font: &Font, text: &str, size: f32) -> f32 {
@@ -974,16 +923,6 @@ fn scale_alpha(color: ColorU8, factor: f32) -> ColorU8 {
 fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
     let t = ((value - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
-}
-
-fn blend_color(a: ColorU8, b: ColorU8, t: f32) -> ColorU8 {
-    let t = t.clamp(0.0, 1.0);
-    ColorU8::from_rgba(
-        lerp(a.red() as f32, b.red() as f32, t) as u8,
-        lerp(a.green() as f32, b.green() as f32, t) as u8,
-        lerp(a.blue() as f32, b.blue() as f32, t) as u8,
-        lerp(a.alpha() as f32, b.alpha() as f32, t) as u8,
-    )
 }
 
 #[cfg(test)]

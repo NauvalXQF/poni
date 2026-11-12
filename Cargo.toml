@@ -2,7 +2,7 @@
 name = "poni"
 version = "0.1.0"
 edition = "2021"
-description = "A small native notch/pill island for Windows."
+description = "A native floating capsule HUD for Windows."
 
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock"] }

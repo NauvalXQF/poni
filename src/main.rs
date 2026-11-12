@@ -2,44 +2,35 @@
 
 mod geometry;
 mod island;
+mod network;
+mod surface;
 
 use std::ffi::c_void;
 use std::path::PathBuf;
-use std::ptr::null_mut;
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use chrono::Local;
 use fontdue::{Font, FontSettings};
-use geometry::{geometry_with_notice, IslandMode, WINDOW_HEIGHT, WINDOW_WIDTH};
+use geometry::{geometry_with_notice, WINDOW_HEIGHT, WINDOW_WIDTH};
 use island::{draw as draw_island, IslandView, NoticeKind};
+use network::{spawn_worker as spawn_network_worker, NetworkState};
 use serde::{Deserialize, Serialize};
-use tiny_skia::Pixmap;
+use surface::LayeredSurface;
 use windows::core::{w, PCWSTR};
-use windows::Win32::Devices::Bluetooth::{
-    BluetoothFindDeviceClose, BluetoothFindFirstDevice, BluetoothFindNextDevice,
-    BLUETOOTH_DEVICE_INFO, BLUETOOTH_DEVICE_SEARCH_PARAMS,
-};
 use windows::Win32::Foundation::{
-    CloseHandle, BOOL, COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE,
-    WAIT_OBJECT_0, WPARAM,
+    CloseHandle, BOOL, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WAIT_OBJECT_0, WPARAM,
 };
 use windows::Win32::Graphics::Dwm::{DwmGetCompositionTimingInfo, DWM_TIMING_INFO};
 use windows::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, GetMonitorInfoW,
-    MonitorFromPoint, MonitorFromWindow, ReleaseDC, ScreenToClient, SelectObject, UpdateWindow,
-    AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS,
-    HDC, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
-};
-use windows::Win32::NetworkManagement::WiFi::{
-    wlan_interface_state_connected, wlan_intf_opcode_current_connection, WlanCloseHandle,
-    WlanEnumInterfaces, WlanFreeMemory, WlanOpenHandle, WlanQueryInterface,
-    WLAN_CONNECTION_ATTRIBUTES, WLAN_INTERFACE_INFO_LIST,
+    GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, ScreenToClient, UpdateWindow,
+    MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
 use windows::Win32::System::Registry::{
     RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
-    HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_DWORD, REG_SZ,
+    HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_SZ,
 };
 use windows::Win32::System::Threading::{
     CreateWaitableTimerExW, SetWaitableTimer, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, INFINITE,
@@ -60,22 +51,21 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetClassNameW, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW,
     GetWindowRect, IsWindowVisible, IsZoomed, LoadCursorW, LoadIconW, MsgWaitForMultipleObjectsEx,
     PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, TrackPopupMenu, TranslateMessage,
-    UpdateLayeredWindow, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HTCLIENT,
-    HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW, IDI_APPLICATION, MA_NOACTIVATE, MF_CHECKED, MF_POPUP,
-    MF_SEPARATOR, MF_STRING, MSG, MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT, SWP_NOACTIVATE,
-    SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNOACTIVATE, TPM_RETURNCMD, TPM_RIGHTBUTTON, ULW_ALPHA, WM_APP,
-    WM_CREATE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_HOTKEY, WM_LBUTTONUP,
-    WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_NULL, WM_QUIT,
-    WM_RBUTTONUP, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_POPUP,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, TrackPopupMenu, TranslateMessage, CREATESTRUCTW,
+    CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW,
+    IDI_APPLICATION, MA_NOACTIVATE, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG,
+    MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE,
+    SW_SHOWNOACTIVATE, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CREATE, WM_DESTROY,
+    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_HOTKEY, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE,
+    WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_NULL, WM_QUIT, WM_RBUTTONUP, WNDCLASSW,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 const WINDOW_CLASS: PCWSTR = w!("PoniIslandWindow");
 const WINDOW_TITLE: PCWSTR = w!("Poni");
-const HOTKEY_MODE: i32 = 1;
+const HOTKEY_PIN: i32 = 1;
 const HOTKEY_QUIT: i32 = 2;
-/// One shared rate for shape, mode, and notice motion so every layer settles
+/// One shared rate for shape and notice motion so every layer settles
 /// together instead of racing each other.
 const MOTION_RATE: f32 = 16.0;
 const HOVER_INTENT: Duration = Duration::from_millis(140);
@@ -83,8 +73,7 @@ const NOTICE_DURATION: Duration = Duration::from_secs(3);
 const NOTICE_QUICK_EXIT: Duration = Duration::from_millis(350);
 const TRAY_MESSAGE: u32 = WM_APP + 1;
 const TRAY_ID: u32 = 1;
-const CMD_NOTCH: usize = 100;
-const CMD_PILL: usize = 101;
+const CMD_PIN: usize = 100;
 const CMD_SCALE_75: usize = 110;
 const CMD_SCALE_100: usize = 111;
 const CMD_SCALE_125: usize = 112;
@@ -101,17 +90,13 @@ fn default_shape_scale() -> f32 {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Settings {
-    mode: IslandMode,
     #[serde(default = "default_shape_scale")]
     shape_scale: f32,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self {
-            mode: IslandMode::Notch,
-            shape_scale: 1.0,
-        }
+        Self { shape_scale: 1.0 }
     }
 }
 
@@ -133,13 +118,6 @@ struct Notice {
     subtitle: String,
     battery: Option<u8>,
     until: Instant,
-}
-
-#[derive(Default, Clone, PartialEq, Eq)]
-struct NetworkState {
-    wifi: Option<String>,
-    bluetooth: Vec<String>,
-    airplane: bool,
 }
 
 unsafe fn foreground_is_fullscreen(our_hwnd: HWND) -> bool {
@@ -213,144 +191,8 @@ fn battery_status() -> BatteryStatus {
     }
 }
 
-unsafe fn current_wifi_ssid() -> Option<String> {
-    let mut negotiated = 0u32;
-    let mut client = HANDLE::default();
-    if WlanOpenHandle(2, None, &mut negotiated, &mut client) != 0 {
-        return None;
-    }
-
-    let mut list: *mut WLAN_INTERFACE_INFO_LIST = null_mut();
-    if WlanEnumInterfaces(client, None, &mut list) != 0 || list.is_null() {
-        let _ = WlanCloseHandle(client, None);
-        return None;
-    }
-
-    let mut result = None;
-    let count = (*list).dwNumberOfItems as usize;
-    for index in 0..count {
-        let info = &*(*list).InterfaceInfo.as_ptr().add(index);
-        if info.isState != wlan_interface_state_connected {
-            continue;
-        }
-
-        let mut data_size = 0u32;
-        let mut data: *mut c_void = null_mut();
-        if WlanQueryInterface(
-            client,
-            &info.InterfaceGuid,
-            wlan_intf_opcode_current_connection,
-            None,
-            &mut data_size,
-            &mut data,
-            None,
-        ) != 0
-            || data.is_null()
-        {
-            continue;
-        }
-
-        let attrs = &*(data as *const WLAN_CONNECTION_ATTRIBUTES);
-        if attrs.isState == wlan_interface_state_connected {
-            let ssid = &attrs.wlanAssociationAttributes.dot11Ssid;
-            let length = (ssid.uSSIDLength as usize).min(ssid.ucSSID.len());
-            if length > 0 {
-                result = Some(String::from_utf8_lossy(&ssid.ucSSID[..length]).to_string());
-            }
-        }
-        WlanFreeMemory(data);
-
-        if result.is_some() {
-            break;
-        }
-    }
-
-    WlanFreeMemory(list.cast());
-    let _ = WlanCloseHandle(client, None);
-    result
-}
-
-unsafe fn connected_bluetooth_devices() -> Vec<String> {
-    let params = BLUETOOTH_DEVICE_SEARCH_PARAMS {
-        dwSize: std::mem::size_of::<BLUETOOTH_DEVICE_SEARCH_PARAMS>() as u32,
-        fReturnAuthenticated: BOOL(1),
-        fReturnRemembered: BOOL(1),
-        fReturnUnknown: BOOL(0),
-        fReturnConnected: BOOL(1),
-        fIssueInquiry: BOOL(0),
-        cTimeoutMultiplier: 0,
-        hRadio: HANDLE::default(),
-    };
-    let mut info = BLUETOOTH_DEVICE_INFO::default();
-    info.dwSize = std::mem::size_of::<BLUETOOTH_DEVICE_INFO>() as u32;
-
-    let Ok(find) = BluetoothFindFirstDevice(&params, &mut info) else {
-        return Vec::new();
-    };
-
-    let mut devices = Vec::new();
-    loop {
-        if info.fConnected.as_bool() {
-            let name = wide_string(&info.szName);
-            if !name.is_empty() && !devices.contains(&name) {
-                devices.push(name);
-            }
-        }
-        if BluetoothFindNextDevice(find, &mut info).is_err() {
-            break;
-        }
-    }
-    let _ = BluetoothFindDeviceClose(find);
-    devices
-}
-
-fn wide_string(value: &[u16]) -> String {
-    let length = value
-        .iter()
-        .position(|&unit| unit == 0)
-        .unwrap_or(value.len());
-    String::from_utf16_lossy(&value[..length])
-}
-
-fn airplane_mode_enabled() -> bool {
-    const KEY: PCWSTR = w!("SYSTEM\\CurrentControlSet\\Control\\RadioManagement\\SystemRadioState");
-    unsafe {
-        let mut key = HKEY::default();
-        if RegOpenKeyExW(HKEY_LOCAL_MACHINE, KEY, 0, KEY_QUERY_VALUE, &mut key).0 != 0 {
-            return false;
-        }
-
-        let mut value = 0u32;
-        let mut value_type = REG_DWORD;
-        let mut size = std::mem::size_of::<u32>() as u32;
-        let mut status = RegQueryValueExW(
-            key,
-            w!(""),
-            None,
-            Some(&mut value_type),
-            Some((&mut value as *mut u32).cast()),
-            Some(&mut size),
-        );
-        if status.0 != 0 {
-            size = std::mem::size_of::<u32>() as u32;
-            status = RegQueryValueExW(
-                key,
-                w!("SystemRadioState"),
-                None,
-                Some(&mut value_type),
-                Some((&mut value as *mut u32).cast()),
-                Some(&mut size),
-            );
-        }
-        let _ = RegCloseKey(key);
-        status.0 == 0 && value != 0
-    }
-}
-
 struct App {
     hwnd: HWND,
-    mode: IslandMode,
-    mode_mix: f32,
     progress: f32,
     hovered: bool,
     hover_since: Option<Instant>,
@@ -364,8 +206,10 @@ struct App {
     fonts: Fonts,
     hit_mask: Vec<u8>,
     time: String,
+    date: String,
     battery: BatteryStatus,
     last_status_update: Instant,
+    network_rx: Receiver<NetworkState>,
     network: NetworkState,
     network_initialized: bool,
     notice: Option<Notice>,
@@ -382,11 +226,9 @@ struct App {
 impl App {
     fn new(timer: HANDLE) -> Self {
         let settings = load_settings();
-        let mode = settings.mode;
+        let network_rx = spawn_network_worker();
         Self {
             hwnd: HWND::default(),
-            mode,
-            mode_mix: mode.mix(),
             progress: 0.0,
             hovered: false,
             hover_since: None,
@@ -402,8 +244,10 @@ impl App {
             fonts: load_fonts(),
             hit_mask: Vec::new(),
             time: Local::now().format("%H:%M").to_string(),
+            date: Local::now().format("%a, %d %b").to_string(),
             battery: BatteryStatus::default(),
             last_status_update: Instant::now(),
+            network_rx,
             network: NetworkState::default(),
             network_initialized: false,
             notice: None,
@@ -429,7 +273,7 @@ impl App {
 
         let _ = RegisterHotKey(
             hwnd,
-            HOTKEY_MODE,
+            HOTKEY_PIN,
             MOD_CONTROL | MOD_ALT | MOD_NOREPEAT,
             'N' as u32,
         );
@@ -500,7 +344,6 @@ impl App {
 
     fn geometry(&self) -> geometry::Geometry {
         geometry_with_notice(
-            self.mode_mix,
             self.progress,
             self.notice_mix,
             self.effective_scale(),
@@ -607,48 +450,44 @@ impl App {
     }
 
     fn update_network_state(&mut self) {
-        let current = NetworkState {
-            wifi: unsafe { current_wifi_ssid() },
-            bluetooth: unsafe { connected_bluetooth_devices() },
-            airplane: airplane_mode_enabled(),
-        };
+        while let Ok(current) = self.network_rx.try_recv() {
+            if !self.network_initialized {
+                self.network = current;
+                self.network_initialized = true;
+                continue;
+            }
 
-        if !self.network_initialized {
+            let new_wifi = if current.wifi != self.network.wifi {
+                current.wifi.clone()
+            } else {
+                None
+            };
+            let new_bluetooth = current
+                .bluetooth
+                .iter()
+                .find(|device| !self.network.bluetooth.contains(device))
+                .cloned();
+            let airplane_changed = current.airplane != self.network.airplane;
+
+            if let Some(ssid) = new_wifi {
+                self.show_notice(NoticeKind::Wifi, "Wi-Fi terhubung", ssid);
+            } else if let Some(device) = new_bluetooth {
+                self.show_notice(NoticeKind::Bluetooth, "Bluetooth terhubung", device);
+            } else if airplane_changed {
+                self.show_notice(
+                    NoticeKind::Airplane,
+                    "Mode pesawat",
+                    if current.airplane {
+                        "Aktif"
+                    } else {
+                        "Nonaktif"
+                    }
+                    .to_string(),
+                );
+            }
+
             self.network = current;
-            self.network_initialized = true;
-            return;
         }
-
-        let new_wifi = if current.wifi != self.network.wifi {
-            current.wifi.clone()
-        } else {
-            None
-        };
-        let new_bluetooth = current
-            .bluetooth
-            .iter()
-            .find(|device| !self.network.bluetooth.contains(device))
-            .cloned();
-        let airplane_changed = current.airplane != self.network.airplane;
-
-        if let Some(ssid) = new_wifi {
-            self.show_notice(NoticeKind::Wifi, "Wi-Fi terhubung", ssid);
-        } else if let Some(device) = new_bluetooth {
-            self.show_notice(NoticeKind::Bluetooth, "Bluetooth terhubung", device);
-        } else if airplane_changed {
-            self.show_notice(
-                NoticeKind::Airplane,
-                "Mode pesawat",
-                if current.airplane {
-                    "Aktif"
-                } else {
-                    "Nonaktif"
-                }
-                .to_string(),
-            );
-        }
-
-        self.network = current;
     }
 
     unsafe fn tick(&mut self) {
@@ -684,12 +523,16 @@ impl App {
         } else {
             0.0
         };
-        let target_mode = self.mode.mix();
         let clock = Local::now().format("%H:%M").to_string();
+        let date = Local::now().format("%a, %d %b").to_string();
 
         let mut changed = self.update_system_status(false);
         if self.time != clock {
             self.time = clock;
+            changed = true;
+        }
+        if self.date != date {
+            self.date = date;
             changed = true;
         }
         if !self.notice_closing
@@ -708,9 +551,6 @@ impl App {
             0.0
         };
         if approach(&mut self.progress, target, dt, MOTION_RATE) {
-            changed = true;
-        }
-        if approach(&mut self.mode_mix, target_mode, dt, MOTION_RATE) {
             changed = true;
         }
         if approach(&mut self.notice_mix, notice_target, dt, MOTION_RATE) {
@@ -758,7 +598,6 @@ impl App {
             0.0
         };
         let animating = (self.progress - target).abs() > 0.002
-            || (self.mode_mix - self.mode.mix()).abs() > 0.002
             || (self.notice_mix - notice_target).abs() > 0.002;
 
         if animating {
@@ -778,15 +617,19 @@ impl App {
             return;
         };
         let view = IslandView {
-            mode: self.mode,
-            mode_mix: self.mode_mix,
             progress: self.progress,
             geometry: self.geometry(),
             scale: self.effective_scale(),
-            pinned: self.pinned,
             time: self.time.clone(),
+            date: self.date.clone(),
             battery_percent: self.battery.percent,
             battery_charging: self.battery.charging,
+            wifi: self.network.wifi.as_deref(),
+            bluetooth: self
+                .network
+                .bluetooth
+                .first()
+                .map(std::string::String::as_str),
             notice_mix: self.notice_mix,
             notice_kind: self.notice.as_ref().map(|notice| notice.kind),
             notice_title: self.notice.as_ref().map(|notice| notice.title.as_str()),
@@ -808,26 +651,13 @@ impl App {
         self.surface = Some(surface);
     }
 
-    unsafe fn toggle_mode(&mut self) {
-        self.set_mode(self.mode.toggle());
-    }
-
-    unsafe fn set_mode(&mut self, mode: IslandMode) {
-        if self.mode == mode {
-            return;
-        }
-        self.mode = mode;
-        save_settings(self.mode, self.shape_scale);
-        self.request_frame();
-    }
-
     unsafe fn set_shape_scale(&mut self, shape_scale: f32) {
         let shape_scale = shape_scale.clamp(SCALE_OPTIONS[0], SCALE_OPTIONS[3]);
         if (self.shape_scale - shape_scale).abs() < f32::EPSILON {
             return;
         }
         self.shape_scale = shape_scale;
-        save_settings(self.mode, self.shape_scale);
+        save_settings(self.shape_scale);
         self.resize_window();
         self.request_frame();
     }
@@ -878,25 +708,15 @@ impl App {
             return;
         };
 
-        let shape_flags = |checked: bool| {
-            if checked {
+        let _ = AppendMenuW(
+            menu,
+            if self.pinned {
                 MF_STRING | MF_CHECKED
             } else {
                 MF_STRING
-            }
-        };
-
-        let _ = AppendMenuW(
-            menu,
-            shape_flags(self.mode == IslandMode::Notch),
-            CMD_NOTCH,
-            w!("Notch"),
-        );
-        let _ = AppendMenuW(
-            menu,
-            shape_flags(self.mode == IslandMode::Pill),
-            CMD_PILL,
-            w!("Pill"),
+            },
+            CMD_PIN,
+            w!("Pin expanded"),
         );
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, w!(""));
 
@@ -949,8 +769,7 @@ impl App {
         let _ = PostMessageW(self.hwnd, WM_NULL, WPARAM(0), LPARAM(0));
 
         match command {
-            CMD_NOTCH => self.set_mode(IslandMode::Notch),
-            CMD_PILL => self.set_mode(IslandMode::Pill),
+            CMD_PIN => self.toggle_pin(),
             CMD_SCALE_75 => self.set_shape_scale(0.75),
             CMD_SCALE_100 => self.set_shape_scale(1.0),
             CMD_SCALE_125 => self.set_shape_scale(1.25),
@@ -1041,14 +860,14 @@ fn load_settings() -> Settings {
         .unwrap_or_default()
 }
 
-fn save_settings(mode: IslandMode, shape_scale: f32) {
+fn save_settings(shape_scale: f32) {
     let Some(path) = settings_path() else {
         return;
     };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Ok(contents) = serde_json::to_string_pretty(&Settings { mode, shape_scale }) {
+    if let Ok(contents) = serde_json::to_string_pretty(&Settings { shape_scale }) {
         let _ = std::fs::write(path, contents);
     }
 }
@@ -1135,126 +954,6 @@ fn log_line(message: &str) {
     }
 }
 
-struct LayeredSurface {
-    width: i32,
-    height: i32,
-    screen: HDC,
-    memory: HDC,
-    bitmap: windows::Win32::Graphics::Gdi::HBITMAP,
-    old_bitmap: HGDIOBJ,
-    bits: *mut u8,
-}
-
-impl LayeredSurface {
-    fn new(width: i32, height: i32) -> windows::core::Result<Self> {
-        if width <= 0 || height <= 0 {
-            return Err(windows::core::Error::from(
-                windows::Win32::Foundation::E_INVALIDARG,
-            ));
-        }
-
-        unsafe {
-            let screen = GetDC(None);
-            if screen.is_invalid() {
-                return Err(windows::core::Error::from_win32());
-            }
-            let memory = CreateCompatibleDC(screen);
-            if memory.is_invalid() {
-                let _ = ReleaseDC(None, screen);
-                return Err(windows::core::Error::from_win32());
-            }
-
-            let bitmap_info = BITMAPINFO {
-                bmiHeader: BITMAPINFOHEADER {
-                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth: width,
-                    biHeight: -height,
-                    biPlanes: 1,
-                    biBitCount: 32,
-                    biCompression: BI_RGB.0,
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-            let mut bits: *mut c_void = null_mut();
-            let bitmap =
-                match CreateDIBSection(screen, &bitmap_info, DIB_RGB_COLORS, &mut bits, None, 0) {
-                    Ok(bitmap) => bitmap,
-                    Err(err) => {
-                        let _ = DeleteDC(memory);
-                        let _ = ReleaseDC(None, screen);
-                        return Err(err);
-                    }
-                };
-            let old_bitmap = SelectObject(memory, HGDIOBJ(bitmap.0));
-
-            Ok(Self {
-                width,
-                height,
-                screen,
-                memory,
-                bitmap,
-                old_bitmap,
-                bits: bits.cast(),
-            })
-        }
-    }
-
-    fn present(&self, hwnd: HWND, pixmap: &Pixmap) {
-        if pixmap.width() != self.width as u32 || pixmap.height() != self.height as u32 {
-            return;
-        }
-
-        unsafe {
-            let data = pixmap.data();
-            let target = std::slice::from_raw_parts_mut(
-                self.bits,
-                (self.width as usize) * (self.height as usize) * 4,
-            );
-            for (dst, src) in target.chunks_exact_mut(4).zip(data.chunks_exact(4)) {
-                dst[0] = src[2];
-                dst[1] = src[1];
-                dst[2] = src[0];
-                dst[3] = src[3];
-            }
-
-            let blend = BLENDFUNCTION {
-                BlendOp: AC_SRC_OVER as u8,
-                BlendFlags: 0,
-                SourceConstantAlpha: 255,
-                AlphaFormat: AC_SRC_ALPHA as u8,
-            };
-            let size = SIZE {
-                cx: self.width,
-                cy: self.height,
-            };
-            let src_point = POINT { x: 0, y: 0 };
-            let _ = UpdateLayeredWindow(
-                hwnd,
-                self.screen,
-                None,
-                Some(&size),
-                self.memory,
-                Some(&src_point),
-                COLORREF(0),
-                Some(&blend),
-                ULW_ALPHA,
-            );
-        }
-    }
-}
-
-impl Drop for LayeredSurface {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = SelectObject(self.memory, self.old_bitmap);
-            let _ = DeleteObject(HGDIOBJ(self.bitmap.0));
-            let _ = DeleteDC(self.memory);
-            let _ = ReleaseDC(None, self.screen);
-        }
-    }
-}
-
 unsafe extern "system" fn wnd_proc(
     hwnd: HWND,
     msg: u32,
@@ -1313,15 +1012,15 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_RBUTTONUP => {
             if let Some(app) = app_mut(hwnd) {
-                app.toggle_mode();
+                app.show_tray_menu();
             }
             LRESULT(0)
         }
         WM_HOTKEY => {
             match wparam.0 as i32 {
-                HOTKEY_MODE => {
+                HOTKEY_PIN => {
                     if let Some(app) = app_mut(hwnd) {
-                        app.toggle_mode();
+                        app.toggle_pin();
                     }
                 }
                 HOTKEY_QUIT => {
@@ -1352,7 +1051,7 @@ unsafe extern "system" fn wnd_proc(
                 if let Some(app) = app_mut(hwnd) {
                     app.remove_tray_icon();
                 }
-                let _ = UnregisterHotKey(hwnd, HOTKEY_MODE);
+                let _ = UnregisterHotKey(hwnd, HOTKEY_PIN);
                 let _ = UnregisterHotKey(hwnd, HOTKEY_QUIT);
             }
             PostQuitMessage(0);
