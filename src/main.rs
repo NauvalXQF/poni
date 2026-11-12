@@ -6,7 +6,7 @@ mod island;
 use std::ffi::c_void;
 use std::path::PathBuf;
 use std::ptr::null_mut;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::Local;
 use fontdue::{Font, FontSettings};
@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use tiny_skia::Pixmap;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, BOOL, COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, SIZE,
+    CloseHandle, BOOL, COLORREF, FILETIME, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, SIZE,
     WAIT_OBJECT_0, WPARAM,
 };
 use windows::Win32::Graphics::Dwm::{DwmGetCompositionTimingInfo, DWM_TIMING_INFO};
@@ -27,13 +27,14 @@ use windows::Win32::Graphics::Gdi::{
     MONITORINFO, MONITOR_DEFAULTTOPRIMARY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
 use windows::Win32::System::Registry::{
     RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
     HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_SZ,
 };
 use windows::Win32::System::Threading::{
-    CreateWaitableTimerExW, SetWaitableTimer, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, INFINITE,
-    TIMER_ALL_ACCESS,
+    CreateWaitableTimerExW, GetSystemTimes, SetWaitableTimer,
+    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, INFINITE, TIMER_ALL_ACCESS,
 };
 use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -104,6 +105,85 @@ struct Fonts {
     semibold: Option<Font>,
 }
 
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+struct BatteryStatus {
+    percent: Option<u8>,
+    charging: bool,
+    plugged: bool,
+}
+
+#[derive(Default)]
+struct CpuSampler {
+    idle: u64,
+    kernel: u64,
+    user: u64,
+    initialized: bool,
+}
+
+impl CpuSampler {
+    fn sample(&mut self) -> Option<u8> {
+        let mut idle = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        unsafe {
+            GetSystemTimes(Some(&mut idle), Some(&mut kernel), Some(&mut user)).ok()?;
+        }
+
+        let idle = filetime_value(idle);
+        let kernel = filetime_value(kernel);
+        let user = filetime_value(user);
+
+        if !self.initialized {
+            self.idle = idle;
+            self.kernel = kernel;
+            self.user = user;
+            self.initialized = true;
+            return None;
+        }
+
+        let idle_delta = idle.saturating_sub(self.idle);
+        let kernel_delta = kernel.saturating_sub(self.kernel);
+        let user_delta = user.saturating_sub(self.user);
+        self.idle = idle;
+        self.kernel = kernel;
+        self.user = user;
+
+        let total = kernel_delta.saturating_add(user_delta);
+        if total == 0 {
+            return None;
+        }
+        let busy = total.saturating_sub(idle_delta);
+        Some(
+            ((busy as f64 / total as f64) * 100.0)
+                .round()
+                .clamp(0.0, 100.0) as u8,
+        )
+    }
+}
+
+fn filetime_value(time: FILETIME) -> u64 {
+    ((time.dwHighDateTime as u64) << 32) | time.dwLowDateTime as u64
+}
+
+fn battery_status() -> BatteryStatus {
+    let mut status = SYSTEM_POWER_STATUS::default();
+    if unsafe { GetSystemPowerStatus(&mut status) }.is_err() {
+        return BatteryStatus::default();
+    }
+
+    let percent = if status.BatteryFlag & 128 != 0 || status.BatteryLifePercent == 255 {
+        None
+    } else {
+        Some(status.BatteryLifePercent.min(100))
+    };
+
+    BatteryStatus {
+        percent,
+        charging: status.BatteryFlag & 8 != 0,
+        plugged: status.ACLineStatus == 1,
+    }
+}
+
 struct App {
     hwnd: HWND,
     mode: IslandMode,
@@ -120,6 +200,10 @@ struct App {
     fonts: Fonts,
     hit_mask: Vec<u8>,
     time: String,
+    cpu_percent: Option<u8>,
+    battery: BatteryStatus,
+    cpu_sampler: CpuSampler,
+    last_status_update: Instant,
     timer: HANDLE,
     refresh_hz: f32,
     last_tick: Instant,
@@ -147,6 +231,10 @@ impl App {
             fonts: load_fonts(),
             hit_mask: Vec::new(),
             time: Local::now().format("%H:%M").to_string(),
+            cpu_percent: None,
+            battery: BatteryStatus::default(),
+            cpu_sampler: CpuSampler::default(),
+            last_status_update: Instant::now(),
             timer,
             refresh_hz: detect_refresh_rate(),
             last_tick: Instant::now(),
@@ -157,6 +245,7 @@ impl App {
         self.hwnd = hwnd;
         self.scale = dpi_scale(hwnd);
         self.refresh_hz = detect_refresh_rate();
+        self.update_system_status(true);
         self.resize_window();
         log_line(&format!("Poni started at {:.1} Hz", self.refresh_hz));
 
@@ -244,6 +333,30 @@ impl App {
         self.hit_mask.get(index).copied().unwrap_or(0) > 127
     }
 
+    fn update_system_status(&mut self, force: bool) -> bool {
+        let now = Instant::now();
+        if !force && now.duration_since(self.last_status_update) < Duration::from_secs(1) {
+            return false;
+        }
+        self.last_status_update = now;
+
+        let mut changed = false;
+        if let Some(cpu) = self.cpu_sampler.sample() {
+            if self.cpu_percent != Some(cpu) {
+                self.cpu_percent = Some(cpu);
+                changed = true;
+            }
+        }
+
+        let battery = battery_status();
+        if self.battery != battery {
+            self.battery = battery;
+            changed = true;
+        }
+
+        changed
+    }
+
     unsafe fn tick(&mut self) {
         let now = Instant::now();
         let dt = now
@@ -266,7 +379,7 @@ impl App {
         let target_mode = self.mode.mix();
         let clock = Local::now().format("%H:%M").to_string();
 
-        let mut changed = false;
+        let mut changed = self.update_system_status(false);
         if self.time != clock {
             self.time = clock;
             changed = true;
@@ -319,6 +432,10 @@ impl App {
             scale: self.effective_scale(),
             pinned: self.pinned,
             time: self.time.clone(),
+            cpu_percent: self.cpu_percent,
+            battery_percent: self.battery.percent,
+            battery_charging: self.battery.charging,
+            battery_plugged: self.battery.plugged,
             regular: self.fonts.regular.as_ref(),
             semibold: self.fonts.semibold.as_ref(),
         };

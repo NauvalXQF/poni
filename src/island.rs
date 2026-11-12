@@ -13,6 +13,10 @@ pub struct IslandView<'a> {
     pub scale: f32,
     pub pinned: bool,
     pub time: String,
+    pub cpu_percent: Option<u8>,
+    pub battery_percent: Option<u8>,
+    pub battery_charging: bool,
+    pub battery_plugged: bool,
     pub regular: Option<&'a Font>,
     pub semibold: Option<&'a Font>,
 }
@@ -118,34 +122,74 @@ fn draw_collapsed(
 
     let s = view.scale;
     let geo = view.geometry;
+    let left = geo.x + 18.0 * s;
+    let right = geo.x + geo.width - 18.0 * s;
     let baseline = geo.y + geo.height / 2.0 + 4.5 * s;
 
-    draw_circle(
-        pixmap,
-        geo.x + 18.0 * s,
-        geo.y + geo.height / 2.0,
-        4.0 * s,
-        scale_alpha(accent, alpha),
-    );
-    draw_text(
-        pixmap,
-        regular,
-        "PONI",
-        geo.x + 30.0 * s,
-        baseline,
-        10.5 * s,
-        scale_alpha(muted, alpha),
-    );
-
-    let time_width = measure_text(semibold, &view.time, 13.0 * s);
+    let time_size = 13.5 * s;
+    let time_width = measure_text(semibold, &view.time, time_size);
     draw_text(
         pixmap,
         semibold,
         &view.time,
-        geo.x + geo.width - 18.0 * s - time_width,
+        left,
         baseline,
-        13.0 * s,
+        time_size,
         scale_alpha(cream, alpha),
+    );
+
+    let cpu_text = match view.cpu_percent {
+        Some(percent) => format!("CPU {percent}%"),
+        None => "CPU --".to_string(),
+    };
+    draw_text(
+        pixmap,
+        regular,
+        &cpu_text,
+        left + time_width + 13.0 * s,
+        baseline - 0.5 * s,
+        9.5 * s,
+        scale_alpha(muted, alpha),
+    );
+
+    let battery_text = match view.battery_percent {
+        Some(percent) => format!("{percent}%"),
+        None => "--".to_string(),
+    };
+    let battery_text_size = 10.0 * s;
+    let battery_text_width = measure_text(semibold, &battery_text, battery_text_size);
+    let battery_text_x = right - battery_text_width;
+    let battery_color = if view.battery_charging || view.battery_plugged {
+        accent
+    } else if view.battery_percent.is_some_and(|percent| percent <= 20) {
+        accent
+    } else {
+        cream
+    };
+    draw_text(
+        pixmap,
+        semibold,
+        &battery_text,
+        battery_text_x,
+        baseline,
+        battery_text_size,
+        scale_alpha(battery_color, alpha),
+    );
+
+    let icon_width = 19.0 * s;
+    let icon_height = 10.0 * s;
+    let icon_x = battery_text_x - 6.0 * s - icon_width;
+    let icon_y = geo.y + geo.height / 2.0 - icon_height / 2.0;
+    draw_battery(
+        pixmap,
+        icon_x,
+        icon_y,
+        icon_width,
+        icon_height,
+        view.battery_percent,
+        view.battery_charging,
+        alpha,
+        battery_color,
     );
 }
 
@@ -350,25 +394,149 @@ fn island_path(geo: &Geometry, mode_mix: f32) -> Option<Path> {
     pb.finish()
 }
 
-fn draw_circle(pixmap: &mut Pixmap, cx: f32, cy: f32, radius: f32, color: ColorU8) {
-    let mut pb = PathBuilder::new();
-    pb.push_circle(cx, cy, radius);
-    if let Some(path) = pb.finish() {
+fn draw_battery(
+    pixmap: &mut Pixmap,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    percent: Option<u8>,
+    charging: bool,
+    alpha: f32,
+    color: ColorU8,
+) {
+    let s = height / 10.0;
+    let nub_width = width * 0.10;
+    let body_width = width - nub_width - s;
+    let radius = height * 0.22;
+    let Some(body) = rounded_rect_path(x, y, body_width, height, radius) else {
+        return;
+    };
+
+    let mut outline = Paint::default();
+    let outline_color = scale_alpha(color, alpha * 0.55);
+    outline.set_color(Color::from_rgba8(
+        outline_color.red(),
+        outline_color.green(),
+        outline_color.blue(),
+        outline_color.alpha(),
+    ));
+    let stroke = Stroke {
+        width: s.max(1.0),
+        ..Default::default()
+    };
+    pixmap.stroke_path(&body, &outline, &stroke, Transform::identity(), None);
+
+    if let Some(percent) = percent {
+        let inset = s * 1.7;
+        let inner_width = (body_width - inset * 2.0) * (percent as f32 / 100.0);
+        if inner_width > 0.1 {
+            if let Some(fill) = rounded_rect_path(
+                x + inset,
+                y + inset,
+                inner_width,
+                height - inset * 2.0,
+                (radius - inset).max(0.0),
+            ) {
+                let mut paint = Paint::default();
+                let fill_color = scale_alpha(color, alpha);
+                paint.set_color(Color::from_rgba8(
+                    fill_color.red(),
+                    fill_color.green(),
+                    fill_color.blue(),
+                    fill_color.alpha(),
+                ));
+                pixmap.fill_path(
+                    &fill,
+                    &paint,
+                    FillRule::Winding,
+                    Transform::identity(),
+                    None,
+                );
+            }
+        }
+    }
+
+    if let Some(nub) = rounded_rect_path(
+        x + body_width + s * 0.7,
+        y + height * 0.30,
+        nub_width,
+        height * 0.40,
+        s * 0.4,
+    ) {
         let mut paint = Paint::default();
+        let nub_color = scale_alpha(color, alpha * 0.55);
         paint.set_color(Color::from_rgba8(
-            color.red(),
-            color.green(),
-            color.blue(),
-            color.alpha(),
+            nub_color.red(),
+            nub_color.green(),
+            nub_color.blue(),
+            nub_color.alpha(),
         ));
-        pixmap.fill_path(
-            &path,
-            &paint,
-            FillRule::Winding,
-            Transform::identity(),
-            None,
+        pixmap.fill_path(&nub, &paint, FillRule::Winding, Transform::identity(), None);
+    }
+
+    if charging {
+        draw_bolt(
+            pixmap,
+            x + body_width / 2.0,
+            y + height / 2.0,
+            height * 0.58,
+            scale_alpha(color, alpha),
         );
     }
+}
+
+fn draw_bolt(pixmap: &mut Pixmap, cx: f32, cy: f32, height: f32, color: ColorU8) {
+    let mut pb = PathBuilder::new();
+    pb.move_to(cx + height * 0.16, cy - height * 0.48);
+    pb.line_to(cx - height * 0.18, cy + height * 0.04);
+    pb.line_to(cx + height * 0.03, cy + height * 0.04);
+    pb.line_to(cx - height * 0.12, cy + height * 0.48);
+    let Some(path) = pb.finish() else {
+        return;
+    };
+    let mut paint = Paint::default();
+    paint.set_color(Color::from_rgba8(
+        color.red(),
+        color.green(),
+        color.blue(),
+        color.alpha(),
+    ));
+    let stroke = Stroke {
+        width: (height * 0.14).max(1.0),
+        ..Default::default()
+    };
+    pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+}
+
+fn rounded_rect_path(x: f32, y: f32, width: f32, height: f32, radius: f32) -> Option<Path> {
+    let radius = radius.min(width / 2.0).min(height / 2.0);
+    let mut pb = PathBuilder::new();
+    pb.move_to(x + radius, y);
+    pb.line_to(x + width - radius, y);
+    if radius > 0.01 {
+        pb.quad_to(x + width, y, x + width, y + radius);
+    } else {
+        pb.line_to(x + width, y);
+    }
+    pb.line_to(x + width, y + height - radius);
+    if radius > 0.01 {
+        pb.quad_to(x + width, y + height, x + width - radius, y + height);
+    } else {
+        pb.line_to(x + width, y + height);
+    }
+    pb.line_to(x + radius, y + height);
+    if radius > 0.01 {
+        pb.quad_to(x, y + height, x, y + height - radius);
+    } else {
+        pb.line_to(x, y + height);
+    }
+    pb.line_to(x, y + radius);
+    if radius > 0.01 {
+        pb.quad_to(x, y, x + radius, y);
+    }
+    pb.close();
+    pb.finish()
 }
 
 fn draw_line(pixmap: &mut Pixmap, x1: f32, y1: f32, x2: f32, y2: f32, color: ColorU8, width: f32) {

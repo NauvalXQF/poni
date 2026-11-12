@@ -5,6 +5,7 @@ A native Windows notch/pill island. Built with Rust, tiny-skia, and the Win32 AP
 ## What works
 
 - Two shapes: **Notch** (attached to the top edge) and **Pill** (floating just below it).
+- Idle HUD: clock, CPU usage, and battery percentage/icon.
 - Hover expands the island; move away to collapse it.
 - Left-click pins/unpins the expanded state.
 - Right-click toggles Notch/Pill.
@@ -15,7 +16,8 @@ A native Windows notch/pill island. Built with Rust, tiny-skia, and the Win32 AP
 - DPI-aware and crisp on scaled displays.
 - Adaptive frame pacing: detects the monitor refresh rate and animates at
   120Hz or 60Hz without changing animation duration.
-- Clock and native-feeling shell UI.
+- Idle HUD uses native `GetSystemTimes` and `GetSystemPowerStatus`; status
+  refreshes once per second and only redraws when a value changes.
 
 Animations are time-based, so the same spring feels identical on a 60Hz and
 120Hz panel. Idle behavior drops to a low-frequency cursor poll instead of
