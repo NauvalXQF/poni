@@ -69,20 +69,9 @@ fn draw_shape(pixmap: &mut Pixmap, view: &IslandView<'_>) {
         SURFACE.alpha(),
     ));
     pixmap.fill_path(&path, &fill, FillRule::Winding, Transform::identity(), None);
-
-    // Attached shapes sit flush with the monitor bezel. Repaint the top lip
-    // with an opaque strip so anti-aliasing cannot leave a translucent seam.
-    if geo.y <= 0.01 {
-        let lip_height = (2.0 * view.scale).max(2.0);
-        if let Some(lip) = rounded_top_strip_path(
-            geo.x - geo.flare - 1.0,
-            0.0,
-            geo.width + geo.flare * 2.0 + 2.0,
-            lip_height,
-        ) {
-            pixmap.fill_path(&lip, &fill, FillRule::Winding, Transform::identity(), None);
-        }
-    }
+    // Double-fill reduces anti-aliased fringe so the attached edge blends into
+    // the OLED bezel without adding a rectangular seam artifact.
+    pixmap.fill_path(&path, &fill, FillRule::Winding, Transform::identity(), None);
 }
 
 fn draw_content(pixmap: &mut Pixmap, view: &IslandView<'_>) {
@@ -640,19 +629,6 @@ fn bolt_path(cx: f32, cy: f32, height: f32) -> Option<Path> {
     pb.line_to(cx - height * 0.18, cy + height * 0.04);
     pb.line_to(cx + height * 0.03, cy + height * 0.04);
     pb.line_to(cx - height * 0.12, cy + height * 0.48);
-    pb.finish()
-}
-
-fn rounded_top_strip_path(x: f32, y: f32, width: f32, height: f32) -> Option<Path> {
-    if width <= 0.0 || height <= 0.0 {
-        return None;
-    }
-    let mut pb = PathBuilder::new();
-    pb.move_to(x, y);
-    pb.line_to(x + width, y);
-    pb.line_to(x + width, y + height);
-    pb.line_to(x, y + height);
-    pb.close();
     pb.finish()
 }
 
