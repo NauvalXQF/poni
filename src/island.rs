@@ -10,8 +10,6 @@ const CORNER_K: f32 = 0.58;
 const SURFACE: ColorU8 = ColorU8::from_rgba(0, 0, 0, 255);
 const TEXT: ColorU8 = ColorU8::from_rgba(245, 244, 240, 250);
 const MUTED: ColorU8 = ColorU8::from_rgba(158, 157, 152, 205);
-#[allow(dead_code)]
-const HAIRLINE: ColorU8 = ColorU8::from_rgba(255, 255, 255, 10);
 const GREEN: ColorU8 = ColorU8::from_rgba(102, 224, 151, 255);
 const RED: ColorU8 = ColorU8::from_rgba(255, 99, 99, 255);
 
@@ -698,27 +696,6 @@ fn island_path(geo: &Geometry) -> Option<Path> {
     );
     pb.close();
     pb.finish()
-}
-
-fn draw_line(pixmap: &mut Pixmap, x1: f32, y1: f32, x2: f32, y2: f32, color: ColorU8, width: f32) {
-    let mut pb = PathBuilder::new();
-    pb.move_to(x1, y1);
-    pb.line_to(x2, y2);
-    if let Some(path) = pb.finish() {
-        let mut paint = Paint::default();
-        paint.set_color(Color::from_rgba8(
-            color.red(),
-            color.green(),
-            color.blue(),
-            color.alpha(),
-        ));
-        let stroke = Stroke {
-            width,
-            line_cap: LineCap::Round,
-            ..Default::default()
-        };
-        pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
-    }
 }
 
 fn elide(font: &Font, text: &str, size: f32, max_width: f32) -> String {
