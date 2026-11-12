@@ -27,6 +27,10 @@ use windows::Win32::Graphics::Gdi::{
     MONITORINFO, MONITOR_DEFAULTTOPRIMARY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Registry::{
+    RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
+    HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_SZ,
+};
 use windows::Win32::System::Threading::{
     CreateWaitableTimerExW, SetWaitableTimer, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, INFINITE,
     TIMER_ALL_ACCESS,
@@ -37,16 +41,22 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, UnregisterHotKey, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT,
 };
+use windows::Win32::UI::Shell::{
+    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
-    GetWindowLongPtrW, LoadCursorW, MsgWaitForMultipleObjectsEx, PeekMessageW, PostQuitMessage,
-    RegisterClassW, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
-    UpdateLayeredWindow, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HTCLIENT,
-    HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW, MA_NOACTIVATE, MSG, MWMO_INPUTAVAILABLE, PM_REMOVE,
-    QS_ALLINPUT, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_SHOWNOACTIVATE, ULW_ALPHA, WM_CREATE,
-    WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_HOTKEY, WM_LBUTTONUP, WM_MOUSEACTIVATE,
-    WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_QUIT, WM_RBUTTONUP, WNDCLASSW,
-    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
+    DispatchMessageW, GetCursorPos, GetWindowLongPtrW, LoadCursorW, LoadIconW,
+    MsgWaitForMultipleObjectsEx, PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW,
+    SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, TrackPopupMenu,
+    TranslateMessage, UpdateLayeredWindow, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA,
+    HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW, IDI_APPLICATION, MA_NOACTIVATE, MF_CHECKED,
+    MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT,
+    SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_SHOWNOACTIVATE, TPM_RETURNCMD, TPM_RIGHTBUTTON, ULW_ALPHA,
+    WM_APP, WM_CREATE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_HOTKEY, WM_LBUTTONUP,
+    WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_NULL, WM_QUIT,
+    WM_RBUTTONUP, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP,
 };
 
 const WINDOW_CLASS: PCWSTR = w!("PoniIslandWindow");
@@ -55,16 +65,36 @@ const HOTKEY_MODE: i32 = 1;
 const HOTKEY_QUIT: i32 = 2;
 const ANIMATION_RATE: f32 = 18.0;
 const MODE_RATE: f32 = 13.0;
+const TRAY_MESSAGE: u32 = WM_APP + 1;
+const TRAY_ID: u32 = 1;
+const CMD_NOTCH: usize = 100;
+const CMD_PILL: usize = 101;
+const CMD_SCALE_75: usize = 110;
+const CMD_SCALE_100: usize = 111;
+const CMD_SCALE_125: usize = 112;
+const CMD_SCALE_130: usize = 113;
+const CMD_AUTOSTART: usize = 120;
+const CMD_QUIT: usize = 130;
+const SCALE_OPTIONS: [f32; 4] = [0.75, 1.0, 1.25, 1.3];
+const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+const RUN_VALUE: PCWSTR = w!("Poni");
+
+fn default_shape_scale() -> f32 {
+    1.0
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Settings {
     mode: IslandMode,
+    #[serde(default = "default_shape_scale")]
+    shape_scale: f32,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             mode: IslandMode::Notch,
+            shape_scale: 1.0,
         }
     }
 }
@@ -77,6 +107,8 @@ struct App {
     hovered: bool,
     pinned: bool,
     scale: f32,
+    shape_scale: f32,
+    tray: Option<NOTIFYICONDATAW>,
     window_width: i32,
     window_height: i32,
     surface: Option<LayeredSurface>,
@@ -89,7 +121,8 @@ struct App {
 
 impl App {
     fn new(timer: HANDLE) -> Self {
-        let mode = load_settings().mode;
+        let settings = load_settings();
+        let mode = settings.mode;
         Self {
             hwnd: HWND::default(),
             mode,
@@ -98,6 +131,10 @@ impl App {
             hovered: false,
             pinned: false,
             scale: 1.0,
+            shape_scale: settings
+                .shape_scale
+                .clamp(SCALE_OPTIONS[0], SCALE_OPTIONS[3]),
+            tray: None,
             window_width: 0,
             window_height: 0,
             surface: None,
@@ -129,12 +166,18 @@ impl App {
             'Q' as u32,
         );
 
+        self.add_tray_icon();
         self.redraw();
     }
 
+    fn effective_scale(&self) -> f32 {
+        self.scale * self.shape_scale
+    }
+
     unsafe fn resize_window(&mut self) {
-        self.window_width = (WINDOW_WIDTH * self.scale).round() as i32;
-        self.window_height = (WINDOW_HEIGHT * self.scale).round() as i32;
+        let scale = self.effective_scale();
+        self.window_width = (WINDOW_WIDTH * scale).round() as i32;
+        self.window_height = (WINDOW_HEIGHT * scale).round() as i32;
 
         self.surface = LayeredSurface::new(self.window_width, self.window_height)
             .map_err(|err| {
@@ -178,7 +221,7 @@ impl App {
         geometry(
             self.mode_mix,
             self.progress,
-            self.scale,
+            self.effective_scale(),
             self.window_width as f32,
         )
     }
@@ -259,7 +302,7 @@ impl App {
             mode_mix: self.mode_mix,
             progress: self.progress,
             geometry: self.geometry(),
-            scale: self.scale,
+            scale: self.effective_scale(),
             pinned: self.pinned,
             time: self.time.clone(),
             font: self.font.as_ref(),
@@ -272,14 +315,158 @@ impl App {
     }
 
     unsafe fn toggle_mode(&mut self) {
-        self.mode = self.mode.toggle();
-        save_settings(self.mode);
+        self.set_mode(self.mode.toggle());
+    }
+
+    unsafe fn set_mode(&mut self, mode: IslandMode) {
+        if self.mode == mode {
+            return;
+        }
+        self.mode = mode;
+        save_settings(self.mode, self.shape_scale);
+        self.request_frame();
+    }
+
+    unsafe fn set_shape_scale(&mut self, shape_scale: f32) {
+        let shape_scale = shape_scale.clamp(SCALE_OPTIONS[0], SCALE_OPTIONS[3]);
+        if (self.shape_scale - shape_scale).abs() < f32::EPSILON {
+            return;
+        }
+        self.shape_scale = shape_scale;
+        save_settings(self.mode, self.shape_scale);
+        self.resize_window();
         self.request_frame();
     }
 
     unsafe fn toggle_pin(&mut self) {
         self.pinned = !self.pinned;
         self.request_frame();
+    }
+
+    unsafe fn add_tray_icon(&mut self) {
+        if self.tray.is_some() {
+            return;
+        }
+
+        let icon = match LoadIconW(None, IDI_APPLICATION) {
+            Ok(icon) => icon,
+            Err(err) => {
+                log_line(&format!("LoadIconW failed: {err}"));
+                return;
+            }
+        };
+
+        let mut data = NOTIFYICONDATAW::default();
+        data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+        data.hWnd = self.hwnd;
+        data.uID = TRAY_ID;
+        data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+        data.uCallbackMessage = TRAY_MESSAGE;
+        data.hIcon = icon;
+        let tip: Vec<u16> = "Poni".encode_utf16().chain(std::iter::once(0)).collect();
+        data.szTip[..tip.len()].copy_from_slice(&tip);
+
+        if Shell_NotifyIconW(NIM_ADD, &data).as_bool() {
+            self.tray = Some(data);
+        } else {
+            log_line("Shell_NotifyIconW(NIM_ADD) failed");
+        }
+    }
+
+    unsafe fn remove_tray_icon(&mut self) {
+        if let Some(data) = self.tray.take() {
+            let _ = Shell_NotifyIconW(NIM_DELETE, &data);
+        }
+    }
+
+    unsafe fn show_tray_menu(&mut self) {
+        let Ok(menu) = CreatePopupMenu() else {
+            return;
+        };
+
+        let shape_flags = |checked: bool| {
+            if checked {
+                MF_STRING | MF_CHECKED
+            } else {
+                MF_STRING
+            }
+        };
+
+        let _ = AppendMenuW(
+            menu,
+            shape_flags(self.mode == IslandMode::Notch),
+            CMD_NOTCH,
+            w!("Notch"),
+        );
+        let _ = AppendMenuW(
+            menu,
+            shape_flags(self.mode == IslandMode::Pill),
+            CMD_PILL,
+            w!("Pill"),
+        );
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, w!(""));
+
+        if let Ok(size_menu) = CreatePopupMenu() {
+            let options = [
+                (CMD_SCALE_75, 0.75, w!("75%")),
+                (CMD_SCALE_100, 1.0, w!("100%")),
+                (CMD_SCALE_125, 1.25, w!("125%")),
+                (CMD_SCALE_130, 1.3, w!("130%")),
+            ];
+            for (id, value, label) in options {
+                let flags = if (self.shape_scale - value).abs() < 0.001 {
+                    MF_STRING | MF_CHECKED
+                } else {
+                    MF_STRING
+                };
+                let _ = AppendMenuW(size_menu, flags, id, label);
+            }
+            let _ = AppendMenuW(menu, MF_POPUP, size_menu.0 as usize, w!("Size"));
+        }
+
+        let autostart_flags = if autostart_enabled() {
+            MF_STRING | MF_CHECKED
+        } else {
+            MF_STRING
+        };
+        let _ = AppendMenuW(
+            menu,
+            autostart_flags,
+            CMD_AUTOSTART,
+            w!("Start with Windows"),
+        );
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, w!(""));
+        let _ = AppendMenuW(menu, MF_STRING, CMD_QUIT, w!("Quit"));
+
+        let _ = SetForegroundWindow(self.hwnd);
+        let mut point = POINT::default();
+        let _ = GetCursorPos(&mut point);
+        let command = TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_RIGHTBUTTON,
+            point.x,
+            point.y,
+            0,
+            self.hwnd,
+            None,
+        )
+        .0 as usize;
+        let _ = DestroyMenu(menu);
+        let _ = PostMessageW(self.hwnd, WM_NULL, WPARAM(0), LPARAM(0));
+
+        match command {
+            CMD_NOTCH => self.set_mode(IslandMode::Notch),
+            CMD_PILL => self.set_mode(IslandMode::Pill),
+            CMD_SCALE_75 => self.set_shape_scale(0.75),
+            CMD_SCALE_100 => self.set_shape_scale(1.0),
+            CMD_SCALE_125 => self.set_shape_scale(1.25),
+            CMD_SCALE_130 => self.set_shape_scale(1.3),
+            CMD_AUTOSTART => set_autostart(!autostart_enabled()),
+            CMD_QUIT => {
+                let _ = DestroyWindow(self.hwnd);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -360,16 +547,51 @@ fn load_settings() -> Settings {
         .unwrap_or_default()
 }
 
-fn save_settings(mode: IslandMode) {
+fn save_settings(mode: IslandMode, shape_scale: f32) {
     let Some(path) = settings_path() else {
         return;
     };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Ok(contents) = serde_json::to_string_pretty(&Settings { mode }) {
+    if let Ok(contents) = serde_json::to_string_pretty(&Settings { mode, shape_scale }) {
         let _ = std::fs::write(path, contents);
     }
+}
+
+fn autostart_enabled() -> bool {
+    unsafe {
+        let mut key = HKEY::default();
+        if RegOpenKeyExW(HKEY_CURRENT_USER, RUN_KEY, 0, KEY_QUERY_VALUE, &mut key).0 != 0 {
+            return false;
+        }
+        let mut size = 0u32;
+        let status = RegQueryValueExW(key, RUN_VALUE, None, None, None, Some(&mut size));
+        let _ = RegCloseKey(key);
+        status.0 == 0 && size > 0
+    }
+}
+
+unsafe fn set_autostart(enabled: bool) {
+    let mut key = HKEY::default();
+    if RegOpenKeyExW(HKEY_CURRENT_USER, RUN_KEY, 0, KEY_SET_VALUE, &mut key).0 != 0 {
+        return;
+    }
+
+    if enabled {
+        let Ok(exe) = std::env::current_exe() else {
+            let _ = RegCloseKey(key);
+            return;
+        };
+        let value = format!("\"{}\"", exe.display());
+        let wide: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
+        let data = std::slice::from_raw_parts(wide.as_ptr().cast::<u8>(), wide.len() * 2);
+        let _ = RegSetValueExW(key, RUN_VALUE, 0, REG_SZ, Some(data));
+    } else {
+        let _ = RegDeleteValueW(key, RUN_VALUE);
+    }
+
+    let _ = RegCloseKey(key);
 }
 
 fn load_font() -> Option<Font> {
@@ -540,6 +762,15 @@ unsafe extern "system" fn wnd_proc(
             }
             LRESULT(0)
         }
+        TRAY_MESSAGE => {
+            let event = lparam.0 as u32;
+            if event == WM_LBUTTONUP || event == WM_RBUTTONUP {
+                if let Some(app) = app_mut(hwnd) {
+                    app.show_tray_menu();
+                }
+            }
+            LRESULT(0)
+        }
         WM_NCHITTEST => {
             let Some(app) = app_ref(hwnd) else {
                 return LRESULT(HTTRANSPARENT as isize);
@@ -606,6 +837,9 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_DESTROY => {
             unsafe {
+                if let Some(app) = app_mut(hwnd) {
+                    app.remove_tray_icon();
+                }
                 let _ = UnregisterHotKey(hwnd, HOTKEY_MODE);
                 let _ = UnregisterHotKey(hwnd, HOTKEY_QUIT);
             }

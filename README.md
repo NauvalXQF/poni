@@ -8,6 +8,7 @@ A native Windows notch/pill island. Built with Rust, tiny-skia, and the Win32 AP
 - Hover expands the island; move away to collapse it.
 - Left-click pins/unpins the expanded state.
 - Right-click toggles Notch/Pill.
+- Tray menu: shape, size (75–130%), Start with Windows, and Quit.
 - `Ctrl+Alt+N` toggles Notch/Pill.
 - `Ctrl+Alt+Q` quits.
 - Transparent, always-on-top, no-activate window with click-through outside the island.
@@ -46,10 +47,10 @@ The island starts at the top center of the primary monitor. It uses a transparen
 
 This is the interaction shell, not the final product. Not built yet:
 
-- System tray icon and settings window.
+- A dedicated settings window (settings currently live in the tray menu).
 - Fullscreen auto-hide.
 - Media controls (SMTC), notifications, clipboard, shelf, timers.
 - Per-monitor profiles and notch calibration.
-- Auto-start and signed installer/updater.
+- Signed installer/updater.
 
 The shell uses a fixed maximum-size window and draws the island inside it, so expanding does not resize the native window.
