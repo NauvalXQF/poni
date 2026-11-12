@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 pub const WINDOW_WIDTH: f32 = 500.0;
 pub const WINDOW_HEIGHT: f32 = 230.0;
 
-pub const COLLAPSED_WIDTH: f32 = 220.0;
+pub const COLLAPSED_WIDTH: f32 = 200.0;
 pub const COLLAPSED_HEIGHT: f32 = 34.0;
 pub const EXPANDED_WIDTH: f32 = 430.0;
 pub const EXPANDED_HEIGHT: f32 = 176.0;

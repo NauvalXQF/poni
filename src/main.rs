@@ -20,8 +20,8 @@ use windows::Win32::Devices::Bluetooth::{
     BLUETOOTH_DEVICE_INFO, BLUETOOTH_DEVICE_SEARCH_PARAMS,
 };
 use windows::Win32::Foundation::{
-    CloseHandle, BOOL, COLORREF, FILETIME, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT,
-    SIZE, WAIT_OBJECT_0, WPARAM,
+    CloseHandle, BOOL, COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE,
+    WAIT_OBJECT_0, WPARAM,
 };
 use windows::Win32::Graphics::Dwm::{DwmGetCompositionTimingInfo, DWM_TIMING_INFO};
 use windows::Win32::Graphics::Gdi::{
@@ -42,8 +42,8 @@ use windows::Win32::System::Registry::{
     HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_DWORD, REG_SZ,
 };
 use windows::Win32::System::Threading::{
-    CreateWaitableTimerExW, GetSystemTimes, SetWaitableTimer,
-    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, INFINITE, TIMER_ALL_ACCESS,
+    CreateWaitableTimerExW, SetWaitableTimer, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, INFINITE,
+    TIMER_ALL_ACCESS,
 };
 use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -140,59 +140,6 @@ struct NetworkState {
     wifi: Option<String>,
     bluetooth: Vec<String>,
     airplane: bool,
-}
-
-#[derive(Default)]
-struct CpuSampler {
-    idle: u64,
-    kernel: u64,
-    user: u64,
-    initialized: bool,
-}
-
-impl CpuSampler {
-    fn sample(&mut self) -> Option<u8> {
-        let mut idle = FILETIME::default();
-        let mut kernel = FILETIME::default();
-        let mut user = FILETIME::default();
-        unsafe {
-            GetSystemTimes(Some(&mut idle), Some(&mut kernel), Some(&mut user)).ok()?;
-        }
-
-        let idle = filetime_value(idle);
-        let kernel = filetime_value(kernel);
-        let user = filetime_value(user);
-
-        if !self.initialized {
-            self.idle = idle;
-            self.kernel = kernel;
-            self.user = user;
-            self.initialized = true;
-            return None;
-        }
-
-        let idle_delta = idle.saturating_sub(self.idle);
-        let kernel_delta = kernel.saturating_sub(self.kernel);
-        let user_delta = user.saturating_sub(self.user);
-        self.idle = idle;
-        self.kernel = kernel;
-        self.user = user;
-
-        let total = kernel_delta.saturating_add(user_delta);
-        if total == 0 {
-            return None;
-        }
-        let busy = total.saturating_sub(idle_delta);
-        Some(
-            ((busy as f64 / total as f64) * 100.0)
-                .round()
-                .clamp(0.0, 100.0) as u8,
-        )
-    }
-}
-
-fn filetime_value(time: FILETIME) -> u64 {
-    ((time.dwHighDateTime as u64) << 32) | time.dwLowDateTime as u64
 }
 
 unsafe fn foreground_is_fullscreen(our_hwnd: HWND) -> bool {
@@ -417,9 +364,7 @@ struct App {
     fonts: Fonts,
     hit_mask: Vec<u8>,
     time: String,
-    cpu_percent: Option<u8>,
     battery: BatteryStatus,
-    cpu_sampler: CpuSampler,
     last_status_update: Instant,
     network: NetworkState,
     network_initialized: bool,
@@ -457,9 +402,7 @@ impl App {
             fonts: load_fonts(),
             hit_mask: Vec::new(),
             time: Local::now().format("%H:%M").to_string(),
-            cpu_percent: None,
             battery: BatteryStatus::default(),
-            cpu_sampler: CpuSampler::default(),
             last_status_update: Instant::now(),
             network: NetworkState::default(),
             network_initialized: false,
@@ -611,13 +554,6 @@ impl App {
         self.last_status_update = now;
 
         let mut changed = false;
-        if let Some(cpu) = self.cpu_sampler.sample() {
-            if self.cpu_percent != Some(cpu) {
-                self.cpu_percent = Some(cpu);
-                changed = true;
-            }
-        }
-
         let battery = battery_status();
         if self.battery != battery {
             self.battery = battery;
@@ -849,7 +785,6 @@ impl App {
             scale: self.effective_scale(),
             pinned: self.pinned,
             time: self.time.clone(),
-            cpu_percent: self.cpu_percent,
             battery_percent: self.battery.percent,
             battery_charging: self.battery.charging,
             notice_mix: self.notice_mix,
