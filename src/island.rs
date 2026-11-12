@@ -28,6 +28,8 @@ pub struct IslandView<'a> {
     pub notice_kind: Option<NoticeKind>,
     pub notice_title: Option<&'a str>,
     pub notice_subtitle: Option<&'a str>,
+    pub notice_battery: Option<u8>,
+    pub notice_phase: f32,
     pub regular: Option<&'a Font>,
     pub semibold: Option<&'a Font>,
 }
@@ -166,26 +168,9 @@ fn draw_collapsed(
         scale_alpha(muted, alpha),
     );
 
-    let battery_text = match view.battery_percent {
-        Some(percent) => format!("{percent}%"),
-        None => "--".to_string(),
-    };
-    let battery_text_size = 10.0 * s;
-    let battery_text_width = measure_text(semibold, &battery_text, battery_text_size);
-    let battery_text_x = right - battery_text_width;
-    draw_text(
-        pixmap,
-        semibold,
-        &battery_text,
-        battery_text_x,
-        baseline,
-        battery_text_size,
-        scale_alpha(cream, alpha),
-    );
-
-    let icon_width = 19.0 * s;
-    let icon_height = 10.0 * s;
-    let icon_x = battery_text_x - 6.0 * s - icon_width;
+    let icon_width = 32.0 * s;
+    let icon_height = 15.0 * s;
+    let icon_x = right - icon_width;
     let icon_y = geo.y + geo.height / 2.0 - icon_height / 2.0;
     draw_battery(
         pixmap,
@@ -196,6 +181,7 @@ fn draw_collapsed(
         view.battery_percent,
         view.battery_charging,
         alpha,
+        semibold,
         cream,
         GREEN,
     );
@@ -214,22 +200,46 @@ fn draw_notice(pixmap: &mut Pixmap, view: &IslandView<'_>, cream: ColorU8, muted
     let s = view.scale;
     let geo = view.geometry;
     let alpha = view.notice_mix;
-    let icon_x = geo.x + 21.0 * s;
+    let icon_x = geo.x + 27.0 * s;
     let center_y = geo.y + geo.height / 2.0;
+    let icon_color = scale_alpha(cream, alpha);
+
+    if kind == NoticeKind::Bluetooth {
+        draw_bluetooth_ring(
+            pixmap,
+            icon_x,
+            center_y,
+            18.0 * s,
+            view.notice_phase,
+            view.notice_battery,
+            alpha,
+            icon_color,
+        );
+    } else {
+        draw_filled_circle(
+            pixmap,
+            icon_x,
+            center_y,
+            17.0 * s,
+            ColorU8::from_rgba(255, 255, 255, (10.0 * alpha) as u8),
+        );
+    }
+
     draw_notice_icon(
         pixmap,
         kind,
         icon_x,
         center_y,
         20.0 * s,
-        scale_alpha(cream, alpha),
+        icon_color,
+        view.notice_phase,
     );
 
     draw_text(
         pixmap,
         semibold,
         title,
-        geo.x + 48.0 * s,
+        geo.x + 54.0 * s,
         geo.y + 26.0 * s,
         12.5 * s,
         scale_alpha(cream, alpha),
@@ -238,11 +248,28 @@ fn draw_notice(pixmap: &mut Pixmap, view: &IslandView<'_>, cream: ColorU8, muted
         pixmap,
         regular,
         subtitle,
-        geo.x + 48.0 * s,
+        geo.x + 54.0 * s,
         geo.y + 45.0 * s,
         10.5 * s,
         scale_alpha(muted, alpha),
     );
+
+    if kind == NoticeKind::Bluetooth {
+        if let Some(battery) = view.notice_battery {
+            let label = format!("{battery}%");
+            let label_size = 10.5 * s;
+            let label_width = measure_text(semibold, &label, label_size);
+            draw_text(
+                pixmap,
+                semibold,
+                &label,
+                geo.x + geo.width - 20.0 * s - label_width,
+                geo.y + 27.0 * s,
+                label_size,
+                scale_alpha(cream, alpha),
+            );
+        }
+    }
 }
 
 fn draw_notice_icon(
@@ -252,17 +279,84 @@ fn draw_notice_icon(
     cy: f32,
     size: f32,
     color: ColorU8,
+    phase: f32,
 ) {
     match kind {
-        NoticeKind::Wifi => draw_wifi_icon(pixmap, cx, cy, size, color),
+        NoticeKind::Wifi => draw_wifi_icon(pixmap, cx, cy, size, color, phase),
         NoticeKind::Bluetooth => draw_bluetooth_icon(pixmap, cx, cy, size, color),
         NoticeKind::Airplane => draw_airplane_icon(pixmap, cx, cy, size, color),
     }
 }
 
-fn draw_wifi_icon(pixmap: &mut Pixmap, cx: f32, cy: f32, size: f32, color: ColorU8) {
+fn draw_bluetooth_ring(
+    pixmap: &mut Pixmap,
+    cx: f32,
+    cy: f32,
+    radius: f32,
+    phase: f32,
+    battery: Option<u8>,
+    alpha: f32,
+    color: ColorU8,
+) {
+    draw_filled_circle(
+        pixmap,
+        cx,
+        cy,
+        radius + 5.0,
+        ColorU8::from_rgba(255, 255, 255, (7.0 * alpha) as u8),
+    );
+    draw_filled_circle(
+        pixmap,
+        cx,
+        cy,
+        radius + 2.0,
+        ColorU8::from_rgba(255, 255, 255, (11.0 * alpha) as u8),
+    );
+    draw_arc(
+        pixmap,
+        cx,
+        cy,
+        radius,
+        0.0,
+        360.0,
+        scale_alpha(color, alpha * 0.22),
+        1.0,
+    );
+
+    if let Some(battery) = battery {
+        let sweep = 360.0 * battery as f32 / 100.0;
+        draw_arc(
+            pixmap,
+            cx,
+            cy,
+            radius,
+            -90.0,
+            -90.0 + sweep,
+            scale_alpha(GREEN, alpha),
+            1.8,
+        );
+    } else {
+        let start = -90.0 + phase * 120.0;
+        draw_arc(
+            pixmap,
+            cx,
+            cy,
+            radius,
+            start,
+            start + 110.0,
+            scale_alpha(color, alpha * 0.8),
+            1.8,
+        );
+    }
+}
+
+fn draw_wifi_icon(pixmap: &mut Pixmap, cx: f32, cy: f32, size: f32, color: ColorU8, phase: f32) {
     let center_y = cy + size * 0.22;
-    for radius in [size * 0.42, size * 0.29, size * 0.16] {
+    for (index, radius) in [size * 0.42, size * 0.29, size * 0.16]
+        .into_iter()
+        .enumerate()
+    {
+        let pulse = 0.62 + 0.38 * (0.5 + 0.5 * (phase * 5.0 - index as f32 * 0.9).sin());
         draw_arc(
             pixmap,
             cx,
@@ -270,7 +364,7 @@ fn draw_wifi_icon(pixmap: &mut Pixmap, cx: f32, cy: f32, size: f32, color: Color
             radius,
             205.0,
             335.0,
-            color,
+            scale_alpha(color, pulse),
             (size * 0.075).max(1.0),
         );
     }
@@ -611,19 +705,30 @@ fn draw_battery(
     percent: Option<u8>,
     charging: bool,
     alpha: f32,
+    font: &Font,
     color: ColorU8,
     charging_color: ColorU8,
 ) {
     let s = height / 10.0;
     let nub_width = width * 0.10;
     let body_width = width - nub_width - s;
-    let radius = height * 0.22;
+    let radius = height * 0.28;
     let Some(body) = rounded_rect_path(x, y, body_width, height, radius) else {
         return;
     };
 
+    let mut body_fill = Paint::default();
+    body_fill.set_color_rgba8(27, 28, 33, (238.0 * alpha) as u8);
+    pixmap.fill_path(
+        &body,
+        &body_fill,
+        FillRule::Winding,
+        Transform::identity(),
+        None,
+    );
+
     let mut outline = Paint::default();
-    let outline_color = scale_alpha(color, alpha * 0.55);
+    let outline_color = scale_alpha(color, alpha * 0.82);
     outline.set_color(Color::from_rgba8(
         outline_color.red(),
         outline_color.green(),
@@ -636,36 +741,6 @@ fn draw_battery(
     };
     pixmap.stroke_path(&body, &outline, &stroke, Transform::identity(), None);
 
-    if let Some(percent) = percent {
-        let inset = s * 1.7;
-        let inner_width = (body_width - inset * 2.0) * (percent as f32 / 100.0);
-        if inner_width > 0.1 {
-            if let Some(fill) = rounded_rect_path(
-                x + inset,
-                y + inset,
-                inner_width,
-                height - inset * 2.0,
-                (radius - inset).max(0.0),
-            ) {
-                let mut paint = Paint::default();
-                let fill_color = scale_alpha(color, alpha);
-                paint.set_color(Color::from_rgba8(
-                    fill_color.red(),
-                    fill_color.green(),
-                    fill_color.blue(),
-                    fill_color.alpha(),
-                ));
-                pixmap.fill_path(
-                    &fill,
-                    &paint,
-                    FillRule::Winding,
-                    Transform::identity(),
-                    None,
-                );
-            }
-        }
-    }
-
     if let Some(nub) = rounded_rect_path(
         x + body_width + s * 0.7,
         y + height * 0.30,
@@ -674,7 +749,7 @@ fn draw_battery(
         s * 0.4,
     ) {
         let mut paint = Paint::default();
-        let nub_color = scale_alpha(color, alpha * 0.55);
+        let nub_color = scale_alpha(color, alpha * 0.82);
         paint.set_color(Color::from_rgba8(
             nub_color.red(),
             nub_color.green(),
@@ -684,12 +759,27 @@ fn draw_battery(
         pixmap.fill_path(&nub, &paint, FillRule::Winding, Transform::identity(), None);
     }
 
+    let label = percent
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "--".to_string());
+    let label_size = height * 0.54;
+    let label_width = measure_text(font, &label, label_size);
+    draw_text(
+        pixmap,
+        font,
+        &label,
+        x + (body_width - label_width) / 2.0,
+        y + height / 2.0 + label_size * 0.34,
+        label_size,
+        scale_alpha(color, alpha),
+    );
+
     if charging {
         draw_bolt(
             pixmap,
-            x + body_width / 2.0,
+            x - s * 6.0,
             y + height / 2.0,
-            height * 0.58,
+            height * 0.62,
             scale_alpha(charging_color, alpha),
         );
     }

@@ -127,6 +127,8 @@ struct Notice {
     kind: NoticeKind,
     title: String,
     subtitle: String,
+    started: Instant,
+    battery: Option<u8>,
     until: Instant,
 }
 
@@ -617,14 +619,27 @@ impl App {
     }
 
     fn show_notice(&mut self, kind: NoticeKind, title: &str, subtitle: String) {
+        self.show_notice_with_battery(kind, title, subtitle, None);
+    }
+
+    fn show_notice_with_battery(
+        &mut self,
+        kind: NoticeKind,
+        title: &str,
+        subtitle: String,
+        battery: Option<u8>,
+    ) {
         if self.hidden_for_fullscreen {
             return;
         }
+        let now = Instant::now();
         self.notice = Some(Notice {
             kind,
             title: title.to_string(),
             subtitle,
-            until: Instant::now() + Duration::from_secs(3),
+            started: now,
+            battery,
+            until: now + Duration::from_secs(3),
         });
         self.request_frame();
     }
@@ -709,6 +724,9 @@ impl App {
         {
             self.notice = None;
         }
+        if self.notice.is_some() {
+            changed = true;
+        }
         let notice_target = if self.notice.is_some() { 1.0 } else { 0.0 };
         if approach(&mut self.progress, target, dt, ANIMATION_RATE) {
             changed = true;
@@ -738,7 +756,8 @@ impl App {
             0.0
         };
         let notice_target = if self.notice.is_some() { 1.0 } else { 0.0 };
-        let animating = (self.progress - target).abs() > 0.002
+        let animating = self.notice.is_some()
+            || (self.progress - target).abs() > 0.002
             || (self.mode_mix - self.mode.mix()).abs() > 0.002
             || (self.notice_mix - notice_target).abs() > 0.002;
 
@@ -773,6 +792,12 @@ impl App {
             notice_kind: self.notice.as_ref().map(|notice| notice.kind),
             notice_title: self.notice.as_ref().map(|notice| notice.title.as_str()),
             notice_subtitle: self.notice.as_ref().map(|notice| notice.subtitle.as_str()),
+            notice_battery: self.notice.as_ref().and_then(|notice| notice.battery),
+            notice_phase: self
+                .notice
+                .as_ref()
+                .map(|notice| notice.started.elapsed().as_secs_f32())
+                .unwrap_or(0.0),
             regular: self.fonts.regular.as_ref(),
             semibold: self.fonts.semibold.as_ref(),
         };
