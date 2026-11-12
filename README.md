@@ -4,14 +4,16 @@ A native Windows capsule HUD. Built with Rust, tiny-skia, and the Win32 API.
 
 ## What works
 
-- One floating capsule that expands into a full dashboard.
+- Two styles: **Attached** (flush against the top edge with a notch-like lip)
+  and **Floating capsule**.
 - Idle HUD: clock and a proportional battery indicator with a green charging state.
 - Expanded view: large clock, date, battery, Wi-Fi SSID, and Bluetooth device.
 - Transient notices for Wi-Fi connection + SSID, Bluetooth device connection with
   battery level, and airplane mode changes.
-- Hover expands the capsule; move away to collapse it.
+- Hover expands the island; move away to collapse it.
 - Left-click or `Ctrl+Alt+N` pins/unpins the expanded state.
-- Right-click opens the capsule menu: pin, size (75–130%), Start with Windows, and Quit.
+- Right-click opens the island menu: pin, shape, size (75–130%), Start with Windows,
+  and Quit.
 - `Ctrl+Alt+Q` quits.
 - Transparent, always-on-top, no-activate window with click-through outside the capsule.
 - Hides automatically for fullscreen apps and returns when fullscreen ends.
@@ -41,9 +43,9 @@ Rust GNU toolchain + MinGW is used on the development machine.
 
 ## Run behavior
 
-The capsule starts at the top center of the primary monitor. It uses a
-transparent layered window and only the capsule's rounded path is interactive.
-The size scale is persisted in:
+The island starts at the top center of the primary monitor. It uses a
+transparent layered window and only the island's rounded path is interactive.
+The shape style and size scale are persisted in:
 
 ```text
 %APPDATA%\Poni\settings.json
@@ -58,5 +60,5 @@ This is the interaction shell, not the final product. Not built yet:
 - Per-monitor profiles and notch calibration.
 - Signed installer/updater.
 
-The shell uses a fixed maximum-size window and draws the capsule inside it, so
+The shell uses a fixed maximum-size window and draws the island inside it, so
 expanding does not resize the native window.

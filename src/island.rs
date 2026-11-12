@@ -56,7 +56,7 @@ pub fn draw(width: u32, height: u32, view: &IslandView<'_>) -> Option<Pixmap> {
 
 fn draw_shape(pixmap: &mut Pixmap, view: &IslandView<'_>) {
     let geo = view.geometry;
-    let Some(path) = rounded_rect_path(geo.x, geo.y, geo.width, geo.height, geo.radius) else {
+    let Some(path) = island_path(&geo) else {
         return;
     };
 
@@ -704,6 +704,69 @@ fn bolt_path(cx: f32, cy: f32, height: f32) -> Option<Path> {
     pb.line_to(cx - height * 0.18, cy + height * 0.04);
     pb.line_to(cx + height * 0.03, cy + height * 0.04);
     pb.line_to(cx - height * 0.12, cy + height * 0.48);
+    pb.finish()
+}
+
+fn island_path(geo: &Geometry) -> Option<Path> {
+    let x = geo.x;
+    let y = geo.y;
+    let width = geo.width;
+    let height = geo.height;
+    if width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+
+    let top_radius = geo.top_radius.min(width / 2.0).min(height / 2.0);
+    let bottom_radius = geo.bottom_radius.min(width / 2.0).min(height / 2.0);
+    let flare = geo.flare.min(width / 2.0);
+    let shoulder = geo.shoulder.min(height / 2.0);
+
+    // Attached shapes keep a lip and a shoulder that falls away to the body.
+    // Floating shapes set flare and shoulder to zero, which collapses this
+    // path into a symmetric rounded capsule.
+    let top_edge_left = x - flare + top_radius;
+    let top_edge_right = x + width + flare - top_radius;
+    let drop = top_radius.max(shoulder).min(height / 2.0);
+    let mut pb = PathBuilder::new();
+
+    pb.move_to(top_edge_left, y);
+    pb.line_to(top_edge_right, y);
+    pb.cubic_to(
+        top_edge_right + (x + width - top_edge_right) * CORNER_K,
+        y,
+        x + width,
+        y + drop * (1.0 - CORNER_K),
+        x + width,
+        y + drop,
+    );
+    pb.line_to(x + width, y + height - bottom_radius);
+    pb.cubic_to(
+        x + width,
+        y + height - bottom_radius + bottom_radius * CORNER_K,
+        x + width - bottom_radius + bottom_radius * CORNER_K,
+        y + height,
+        x + width - bottom_radius,
+        y + height,
+    );
+    pb.line_to(x + bottom_radius, y + height);
+    pb.cubic_to(
+        x + bottom_radius - bottom_radius * CORNER_K,
+        y + height,
+        x,
+        y + height - bottom_radius + bottom_radius * CORNER_K,
+        x,
+        y + height - bottom_radius,
+    );
+    pb.line_to(x, y + drop);
+    pb.cubic_to(
+        x,
+        y + drop * (1.0 - CORNER_K),
+        top_edge_left + (x - top_edge_left) * CORNER_K,
+        y,
+        top_edge_left,
+        y,
+    );
+    pb.close();
     pb.finish()
 }
 

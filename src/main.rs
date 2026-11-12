@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use chrono::Local;
 use fontdue::{Font, FontSettings};
-use geometry::{geometry_with_notice, WINDOW_HEIGHT, WINDOW_WIDTH};
+use geometry::{geometry_with_notice, ShapeStyle, WINDOW_HEIGHT, WINDOW_WIDTH};
 use island::{draw as draw_island, IslandView, NoticeKind};
 use network::{spawn_worker as spawn_network_worker, NetworkState};
 use serde::{Deserialize, Serialize};
@@ -74,6 +74,8 @@ const NOTICE_QUICK_EXIT: Duration = Duration::from_millis(350);
 const TRAY_MESSAGE: u32 = WM_APP + 1;
 const TRAY_ID: u32 = 1;
 const CMD_PIN: usize = 100;
+const CMD_STYLE_ATTACHED: usize = 105;
+const CMD_STYLE_FLOATING: usize = 106;
 const CMD_SCALE_75: usize = 110;
 const CMD_SCALE_100: usize = 111;
 const CMD_SCALE_125: usize = 112;
@@ -90,13 +92,18 @@ fn default_shape_scale() -> f32 {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Settings {
+    #[serde(default)]
+    style: ShapeStyle,
     #[serde(default = "default_shape_scale")]
     shape_scale: f32,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { shape_scale: 1.0 }
+        Self {
+            style: ShapeStyle::default(),
+            shape_scale: 1.0,
+        }
     }
 }
 
@@ -197,6 +204,7 @@ struct App {
     hovered: bool,
     hover_since: Option<Instant>,
     pinned: bool,
+    style: ShapeStyle,
     scale: f32,
     shape_scale: f32,
     tray: Option<NOTIFYICONDATAW>,
@@ -233,6 +241,7 @@ impl App {
             hovered: false,
             hover_since: None,
             pinned: false,
+            style: settings.style,
             scale: 1.0,
             shape_scale: settings
                 .shape_scale
@@ -346,6 +355,7 @@ impl App {
         geometry_with_notice(
             self.progress,
             self.notice_mix,
+            self.style,
             self.effective_scale(),
             self.window_width as f32,
         )
@@ -651,13 +661,22 @@ impl App {
         self.surface = Some(surface);
     }
 
+    unsafe fn set_style(&mut self, style: ShapeStyle) {
+        if self.style == style {
+            return;
+        }
+        self.style = style;
+        save_settings(self.style, self.shape_scale);
+        self.request_frame();
+    }
+
     unsafe fn set_shape_scale(&mut self, shape_scale: f32) {
         let shape_scale = shape_scale.clamp(SCALE_OPTIONS[0], SCALE_OPTIONS[3]);
         if (self.shape_scale - shape_scale).abs() < f32::EPSILON {
             return;
         }
         self.shape_scale = shape_scale;
-        save_settings(self.shape_scale);
+        save_settings(self.style, self.shape_scale);
         self.resize_window();
         self.request_frame();
     }
@@ -720,6 +739,30 @@ impl App {
         );
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, w!(""));
 
+        if let Ok(style_menu) = CreatePopupMenu() {
+            let options = [
+                (
+                    CMD_STYLE_ATTACHED,
+                    ShapeStyle::Attached,
+                    w!("Attached to top edge"),
+                ),
+                (
+                    CMD_STYLE_FLOATING,
+                    ShapeStyle::Floating,
+                    w!("Floating capsule"),
+                ),
+            ];
+            for (id, value, label) in options {
+                let flags = if self.style == value {
+                    MF_STRING | MF_CHECKED
+                } else {
+                    MF_STRING
+                };
+                let _ = AppendMenuW(style_menu, flags, id, label);
+            }
+            let _ = AppendMenuW(menu, MF_POPUP, style_menu.0 as usize, w!("Shape"));
+        }
+
         if let Ok(size_menu) = CreatePopupMenu() {
             let options = [
                 (CMD_SCALE_75, 0.75, w!("75%")),
@@ -770,6 +813,8 @@ impl App {
 
         match command {
             CMD_PIN => self.toggle_pin(),
+            CMD_STYLE_ATTACHED => self.set_style(ShapeStyle::Attached),
+            CMD_STYLE_FLOATING => self.set_style(ShapeStyle::Floating),
             CMD_SCALE_75 => self.set_shape_scale(0.75),
             CMD_SCALE_100 => self.set_shape_scale(1.0),
             CMD_SCALE_125 => self.set_shape_scale(1.25),
@@ -860,14 +905,14 @@ fn load_settings() -> Settings {
         .unwrap_or_default()
 }
 
-fn save_settings(shape_scale: f32) {
+fn save_settings(style: ShapeStyle, shape_scale: f32) {
     let Some(path) = settings_path() else {
         return;
     };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Ok(contents) = serde_json::to_string_pretty(&Settings { shape_scale }) {
+    if let Ok(contents) = serde_json::to_string_pretty(&Settings { style, shape_scale }) {
         let _ = std::fs::write(path, contents);
     }
 }
