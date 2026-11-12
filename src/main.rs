@@ -99,6 +99,11 @@ impl Default for Settings {
     }
 }
 
+struct Fonts {
+    regular: Option<Font>,
+    semibold: Option<Font>,
+}
+
 struct App {
     hwnd: HWND,
     mode: IslandMode,
@@ -112,7 +117,8 @@ struct App {
     window_width: i32,
     window_height: i32,
     surface: Option<LayeredSurface>,
-    font: Option<Font>,
+    fonts: Fonts,
+    hit_mask: Vec<u8>,
     time: String,
     timer: HANDLE,
     refresh_hz: f32,
@@ -138,7 +144,8 @@ impl App {
             window_width: 0,
             window_height: 0,
             surface: None,
-            font: load_font(),
+            fonts: load_fonts(),
+            hit_mask: Vec::new(),
             time: Local::now().format("%H:%M").to_string(),
             timer,
             refresh_hz: detect_refresh_rate(),
@@ -178,6 +185,7 @@ impl App {
         let scale = self.effective_scale();
         self.window_width = (WINDOW_WIDTH * scale).round() as i32;
         self.window_height = (WINDOW_HEIGHT * scale).round() as i32;
+        self.hit_mask = vec![0; (self.window_width * self.window_height) as usize];
 
         self.surface = LayeredSurface::new(self.window_width, self.window_height)
             .map_err(|err| {
@@ -227,7 +235,13 @@ impl App {
     }
 
     fn hit_test(&self, px: f32, py: f32) -> bool {
-        self.geometry().contains(px, py)
+        let x = px.floor() as i32;
+        let y = py.floor() as i32;
+        if x < 0 || y < 0 || x >= self.window_width || y >= self.window_height {
+            return false;
+        }
+        let index = y as usize * self.window_width as usize + x as usize;
+        self.hit_mask.get(index).copied().unwrap_or(0) > 127
     }
 
     unsafe fn tick(&mut self) {
@@ -305,10 +319,16 @@ impl App {
             scale: self.effective_scale(),
             pinned: self.pinned,
             time: self.time.clone(),
-            font: self.font.as_ref(),
+            regular: self.fonts.regular.as_ref(),
+            semibold: self.fonts.semibold.as_ref(),
         };
 
         if let Some(pixmap) = draw_island(surface.width as u32, surface.height as u32, &view) {
+            if self.hit_mask.len() == (pixmap.width() * pixmap.height()) as usize {
+                for (dst, src) in self.hit_mask.iter_mut().zip(pixmap.data().chunks_exact(4)) {
+                    *dst = if src[3] > 127 { 255 } else { 0 };
+                }
+            }
             surface.present(self.hwnd, &pixmap);
         }
         self.surface = Some(surface);
@@ -594,9 +614,16 @@ unsafe fn set_autostart(enabled: bool) {
     let _ = RegCloseKey(key);
 }
 
-fn load_font() -> Option<Font> {
-    for name in ["segoeuib.ttf", "segoeui.ttf", "arialbd.ttf", "arial.ttf"] {
-        let path = PathBuf::from(r"C:\Windows\Fonts").join(name);
+fn font_directory() -> PathBuf {
+    std::env::var_os("WINDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+        .join("Fonts")
+}
+
+fn load_font_file(names: &[&str]) -> Option<Font> {
+    for name in names {
+        let path = font_directory().join(name);
         if let Ok(bytes) = std::fs::read(path) {
             if let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) {
                 return Some(font);
@@ -604,6 +631,17 @@ fn load_font() -> Option<Font> {
         }
     }
     None
+}
+
+fn load_fonts() -> Fonts {
+    let fonts = Fonts {
+        regular: load_font_file(&["segoeui.ttf", "arial.ttf"]),
+        semibold: load_font_file(&["seguisb.ttf", "segoeuib.ttf", "arialbd.ttf"]),
+    };
+    if fonts.regular.is_none() {
+        log_line("no regular UI font found; falling back to semibold");
+    }
+    fonts
 }
 
 fn log_line(message: &str) {

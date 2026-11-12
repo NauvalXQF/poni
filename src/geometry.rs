@@ -8,6 +8,11 @@ pub const COLLAPSED_HEIGHT: f32 = 34.0;
 pub const EXPANDED_WIDTH: f32 = 430.0;
 pub const EXPANDED_HEIGHT: f32 = 176.0;
 
+/// How far the notch lip reaches past the body on each side, in logical pixels.
+pub const NOTCH_FLARE: f32 = 20.0;
+/// How far the notch shoulder drops from the top edge, in logical pixels.
+pub const NOTCH_SHOULDER: f32 = 14.0;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum IslandMode {
@@ -26,6 +31,13 @@ impl IslandMode {
         match self {
             Self::Notch => "NOTCH",
             Self::Pill => "PILL",
+        }
+    }
+
+    pub fn subtitle(self) -> &'static str {
+        match self {
+            Self::Notch => "Attached notch",
+            Self::Pill => "Floating pill",
         }
     }
 
@@ -64,11 +76,12 @@ pub fn geometry(mode_mix: f32, progress: f32, scale: f32, window_width: f32) -> 
     let height = lerp(COLLAPSED_HEIGHT, EXPANDED_HEIGHT, progress) * scale;
     let x = (window_width - width) / 2.0;
     let y = lerp(0.0, 10.0, mode_mix) * scale;
-    let top_radius = lerp(0.0, 17.0, mode_mix) * scale;
-    let bottom_radius = lerp(17.0, 26.0, progress) * scale;
+    let pill_radius = lerp(17.0, 26.0, progress) * scale;
+    let top_radius = lerp(0.0, pill_radius, mode_mix);
+    let bottom_radius = pill_radius;
     let notch_mix = 1.0 - mode_mix;
-    let notch_flare = 12.0 * notch_mix * scale;
-    let notch_shoulder = 9.0 * notch_mix * scale;
+    let notch_flare = NOTCH_FLARE * notch_mix * scale;
+    let notch_shoulder = NOTCH_SHOULDER * notch_mix * scale;
 
     Geometry {
         x,
@@ -80,54 +93,6 @@ pub fn geometry(mode_mix: f32, progress: f32, scale: f32, window_width: f32) -> 
         notch_flare,
         notch_shoulder,
     }
-}
-
-impl Geometry {
-    pub fn contains(&self, px: f32, py: f32) -> bool {
-        if self.notch_flare > 0.01
-            && py >= self.y
-            && py <= self.y + self.notch_shoulder
-            && px >= self.x - self.notch_flare
-            && px <= self.x + self.width + self.notch_flare
-        {
-            return true;
-        }
-
-        if px < self.x || px > self.x + self.width || py < self.y || py > self.y + self.height {
-            return false;
-        }
-
-        let local_x = px - self.x;
-        let local_y = py - self.y;
-        let tr = self.top_radius;
-        let br = self.bottom_radius;
-
-        if local_y < tr {
-            if local_x < tr {
-                return circle_contains(local_x, local_y, tr, tr, tr);
-            }
-            if local_x > self.width - tr {
-                return circle_contains(local_x, local_y, self.width - tr, tr, tr);
-            }
-        }
-
-        if local_y > self.height - br {
-            if local_x < br {
-                return circle_contains(local_x, local_y, br, self.height - br, br);
-            }
-            if local_x > self.width - br {
-                return circle_contains(local_x, local_y, self.width - br, self.height - br, br);
-            }
-        }
-
-        true
-    }
-}
-
-fn circle_contains(px: f32, py: f32, cx: f32, cy: f32, radius: f32) -> bool {
-    let dx = px - cx;
-    let dy = py - cy;
-    dx * dx + dy * dy <= radius * radius
 }
 
 pub fn lerp(a: f32, b: f32, t: f32) -> f32 {
@@ -145,7 +110,6 @@ mod tests {
         assert_eq!(geo.top_radius, 0.0);
         assert!(geo.notch_flare > 0.0);
         assert!(geo.width < 500.0);
-        assert!(geo.contains(geo.x - geo.notch_flare + 1.0, 1.0));
     }
 
     #[test]
@@ -153,6 +117,7 @@ mod tests {
         let geo = geometry(1.0, 0.0, 1.0, 500.0);
         assert!(geo.y > 0.0);
         assert!(geo.top_radius > 0.0);
+        assert_eq!(geo.notch_flare, 0.0);
     }
 
     #[test]
@@ -164,11 +129,22 @@ mod tests {
     }
 
     #[test]
-    fn hit_test_respects_the_rounded_shape() {
-        let geo = geometry(1.0, 0.0, 1.0, 500.0);
-        assert!(geo.contains(250.0, 20.0));
-        assert!(!geo.contains(10.0, 20.0));
-        assert!(!geo.contains(250.0, 100.0));
+    fn pill_corners_are_symmetric() {
+        let geo = geometry(1.0, 1.0, 1.0, 500.0);
+        assert!((geo.top_radius - geo.bottom_radius).abs() < 0.01);
+    }
+
+    #[test]
+    fn mode_transition_is_monotonic() {
+        let notch = geometry(0.0, 0.0, 1.0, 500.0);
+        let middle = geometry(0.5, 0.0, 1.0, 500.0);
+        let pill = geometry(1.0, 0.0, 1.0, 500.0);
+        assert!(notch.notch_flare > middle.notch_flare);
+        assert!(middle.notch_flare > pill.notch_flare);
+        assert!(notch.top_radius < middle.top_radius);
+        assert!(middle.top_radius < pill.top_radius);
+        assert!(notch.y < middle.y);
+        assert!(middle.y < pill.y);
     }
 
     #[test]

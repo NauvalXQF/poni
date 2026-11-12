@@ -3,6 +3,8 @@ use tiny_skia::{Color, ColorU8, FillRule, Paint, Path, PathBuilder, Pixmap, Stro
 
 use crate::geometry::{lerp, Geometry, IslandMode};
 
+const CORNER_K: f32 = 0.552_284_8;
+
 pub struct IslandView<'a> {
     pub mode: IslandMode,
     pub mode_mix: f32,
@@ -11,49 +13,29 @@ pub struct IslandView<'a> {
     pub scale: f32,
     pub pinned: bool,
     pub time: String,
-    pub font: Option<&'a Font>,
+    pub regular: Option<&'a Font>,
+    pub semibold: Option<&'a Font>,
 }
 
 pub fn draw(width: u32, height: u32, view: &IslandView<'_>) -> Option<Pixmap> {
-    let mut pixmap = Pixmap::new(width, height)?;
+    let mut shape = Pixmap::new(width, height)?;
+    draw_shape(&mut shape, view);
+
+    // Content is rendered into its own layer so it can be clipped to the
+    // shape. Without this, expanded text briefly floats outside the island
+    // while the shape is still growing.
+    let mut content = Pixmap::new(width, height)?;
+    draw_content(&mut content, view);
+    clip_to_shape(&mut content, &shape, 128);
+    composite_layer(&mut shape, &content, 1.0);
+
+    Some(shape)
+}
+
+fn draw_shape(pixmap: &mut Pixmap, view: &IslandView<'_>) {
     let geo = view.geometry;
-
-    if view.mode_mix > 0.01 {
-        let shadow = rounded_rect_path(
-            geo.x - 1.0 * view.scale,
-            geo.y + 4.0 * view.scale,
-            geo.width + 2.0 * view.scale,
-            geo.height,
-            geo.top_radius,
-            geo.bottom_radius,
-        );
-        if let Some(path) = shadow {
-            let mut paint = Paint::default();
-            paint.set_color_rgba8(0, 0, 0, (70.0 * view.mode_mix) as u8);
-            pixmap.fill_path(
-                &path,
-                &paint,
-                FillRule::Winding,
-                Transform::identity(),
-                None,
-            );
-        }
-    }
-
-    let path = if view.mode == IslandMode::Notch {
-        notch_path(&geo)
-    } else {
-        rounded_rect_path(
-            geo.x,
-            geo.y,
-            geo.width,
-            geo.height,
-            geo.top_radius,
-            geo.bottom_radius,
-        )
-    };
-    let Some(path) = path else {
-        return Some(pixmap);
+    let Some(path) = island_path(&geo) else {
+        return;
     };
 
     let mut fill = Paint::default();
@@ -79,105 +61,187 @@ pub fn draw(width: u32, height: u32, view: &IslandView<'_>) -> Option<Pixmap> {
         };
         pixmap.stroke_path(&path, &border, &stroke, Transform::identity(), None);
     }
-
-    if let Some(font) = view.font {
-        draw_content(&mut pixmap, view, font);
-    }
-
-    Some(pixmap)
 }
 
-fn draw_content(pixmap: &mut Pixmap, view: &IslandView<'_>, font: &Font) {
-    let geo = view.geometry;
-    let s = view.scale;
+fn draw_content(pixmap: &mut Pixmap, view: &IslandView<'_>) {
+    if view.regular.is_none() && view.semibold.is_none() {
+        return;
+    }
+
     let accent = ColorU8::from_rgba(255, 178, 36, 255);
     let cream = ColorU8::from_rgba(245, 241, 232, 245);
     let muted = ColorU8::from_rgba(190, 184, 174, 185);
 
-    let dot_x = geo.x + 18.0 * s;
-    let dot_y = geo.y + geo.height / 2.0;
-    draw_circle(pixmap, dot_x, dot_y, 4.0 * s, accent);
+    let collapsed_alpha = 1.0 - smoothstep(0.15, 0.45, view.progress);
+    let expanded_alpha = smoothstep(0.50, 0.92, view.progress);
 
-    if view.progress < 0.45 {
-        let baseline = dot_y + 4.5 * s;
-        draw_text(
-            pixmap,
-            font,
-            "PONI",
-            geo.x + 30.0 * s,
-            baseline,
-            10.5 * s,
-            muted,
-        );
-        let time_width = measure_text(font, &view.time, 13.0 * s);
-        draw_text(
-            pixmap,
-            font,
-            &view.time,
-            geo.x + geo.width - 18.0 * s - time_width,
-            baseline,
-            13.0 * s,
-            cream,
-        );
+    if collapsed_alpha > 0.01 {
+        draw_collapsed(pixmap, view, collapsed_alpha, accent, cream, muted);
+    }
+    if expanded_alpha > 0.01 {
+        draw_expanded(pixmap, view, expanded_alpha, accent, cream, muted);
+    }
+}
+
+fn draw_collapsed(
+    pixmap: &mut Pixmap,
+    view: &IslandView<'_>,
+    alpha: f32,
+    accent: ColorU8,
+    cream: ColorU8,
+    muted: ColorU8,
+) {
+    let Some(regular) = view.regular.or(view.semibold) else {
         return;
+    };
+    let semibold = view.semibold.unwrap_or(regular);
+
+    let s = view.scale;
+    let geo = view.geometry;
+    let baseline = geo.y + geo.height / 2.0 + 4.5 * s;
+
+    draw_circle(
+        pixmap,
+        geo.x + 18.0 * s,
+        geo.y + geo.height / 2.0,
+        4.0 * s,
+        scale_alpha(accent, alpha),
+    );
+    draw_text(
+        pixmap,
+        regular,
+        "PONI",
+        geo.x + 30.0 * s,
+        baseline,
+        10.5 * s,
+        scale_alpha(muted, alpha),
+    );
+
+    let time_width = measure_text(semibold, &view.time, 13.0 * s);
+    draw_text(
+        pixmap,
+        semibold,
+        &view.time,
+        geo.x + geo.width - 18.0 * s - time_width,
+        baseline,
+        13.0 * s,
+        scale_alpha(cream, alpha),
+    );
+}
+
+fn draw_expanded(
+    pixmap: &mut Pixmap,
+    view: &IslandView<'_>,
+    alpha: f32,
+    accent: ColorU8,
+    cream: ColorU8,
+    muted: ColorU8,
+) {
+    let Some(regular) = view.regular.or(view.semibold) else {
+        return;
+    };
+    let semibold = view.semibold.unwrap_or(regular);
+
+    let s = view.scale;
+    let geo = view.geometry;
+    let left = geo.x + 24.0 * s;
+    let right = geo.x + geo.width - 24.0 * s;
+
+    draw_text(
+        pixmap,
+        semibold,
+        "Poni",
+        left,
+        geo.y + 36.0 * s,
+        20.0 * s,
+        scale_alpha(cream, alpha),
+    );
+
+    // The target mode is already selected when the toggle happens, so fade
+    // the previous label/subtitle out and the new one in as mode_mix settles.
+    let target_mix = view.mode.mix();
+    let to_target = if target_mix > 0.5 {
+        view.mode_mix
+    } else {
+        1.0 - view.mode_mix
+    };
+    let start = view.mode.toggle();
+    let out_alpha = alpha * (1.0 - smoothstep(0.0, 0.5, to_target));
+    let in_alpha = alpha * smoothstep(0.5, 1.0, to_target);
+
+    let label_size = 10.0 * s;
+    let label_baseline = geo.y + 34.0 * s;
+    if out_alpha > 0.01 {
+        let label = start.label();
+        let width = measure_text(semibold, label, label_size);
+        draw_text(
+            pixmap,
+            semibold,
+            label,
+            right - width,
+            label_baseline,
+            label_size,
+            scale_alpha(accent, out_alpha),
+        );
+    }
+    if in_alpha > 0.01 {
+        let label = view.mode.label();
+        let width = measure_text(semibold, label, label_size);
+        draw_text(
+            pixmap,
+            semibold,
+            label,
+            right - width,
+            label_baseline,
+            label_size,
+            scale_alpha(accent, in_alpha),
+        );
     }
 
-    let heading_baseline = geo.y + 34.0 * s;
-    draw_text(
-        pixmap,
-        font,
-        "Poni",
-        geo.x + 43.0 * s,
-        heading_baseline,
-        20.0 * s,
-        cream,
-    );
+    let subtitle_size = 12.0 * s;
+    let subtitle_baseline = geo.y + 60.0 * s;
+    if out_alpha > 0.01 {
+        draw_text(
+            pixmap,
+            regular,
+            start.subtitle(),
+            left,
+            subtitle_baseline,
+            subtitle_size,
+            scale_alpha(muted, out_alpha),
+        );
+    }
+    if in_alpha > 0.01 {
+        draw_text(
+            pixmap,
+            regular,
+            view.mode.subtitle(),
+            left,
+            subtitle_baseline,
+            subtitle_size,
+            scale_alpha(muted, in_alpha),
+        );
+    }
 
-    let mode_label = view.mode.label();
-    let mode_width = measure_text(font, mode_label, 10.0 * s);
-    draw_text(
-        pixmap,
-        font,
-        mode_label,
-        geo.x + geo.width - 23.0 * s - mode_width,
-        geo.y + 31.0 * s,
-        10.0 * s,
-        accent,
-    );
-
-    let subtitle = match view.mode {
-        IslandMode::Notch => "Attached notch",
-        IslandMode::Pill => "Floating pill",
-    };
-    draw_text(
-        pixmap,
-        font,
-        subtitle,
-        geo.x + 43.0 * s,
-        geo.y + 58.0 * s,
-        11.5 * s,
-        muted,
-    );
-
-    let divider_y = geo.y + 78.0 * s;
+    let divider_y = geo.y + 82.0 * s;
     draw_line(
         pixmap,
-        geo.x + 23.0 * s,
+        left,
         divider_y,
-        geo.x + geo.width - 23.0 * s,
+        right,
         divider_y,
-        ColorU8::from_rgba(255, 178, 36, 28),
+        scale_alpha(ColorU8::from_rgba(255, 178, 36, 28), alpha),
         1.0 * s,
     );
 
     draw_text(
         pixmap,
-        font,
+        regular,
         "Two shapes. One quiet island.",
-        geo.x + 24.0 * s,
-        geo.y + 108.0 * s,
-        12.5 * s,
-        cream,
+        left,
+        geo.y + 112.0 * s,
+        13.0 * s,
+        scale_alpha(cream, alpha),
     );
 
     let hint = if view.pinned {
@@ -187,97 +251,80 @@ fn draw_content(pixmap: &mut Pixmap, view: &IslandView<'_>, font: &Font) {
     };
     draw_text(
         pixmap,
-        font,
+        regular,
         hint,
-        geo.x + 24.0 * s,
-        geo.y + 134.0 * s,
-        10.5 * s,
-        muted,
+        left,
+        geo.y + 138.0 * s,
+        11.0 * s,
+        scale_alpha(muted, alpha),
     );
 
     draw_text(
         pixmap,
-        font,
+        regular,
         "Ctrl+Alt+N  shape   ·   Ctrl+Alt+Q  quit",
-        geo.x + 24.0 * s,
-        geo.y + 154.0 * s,
-        9.5 * s,
-        muted,
+        left,
+        geo.y + 160.0 * s,
+        10.5 * s,
+        scale_alpha(muted, alpha),
     );
 }
 
-fn notch_path(geo: &Geometry) -> Option<Path> {
+fn island_path(geo: &Geometry) -> Option<Path> {
     let x = geo.x;
     let y = geo.y;
     let width = geo.width;
     let height = geo.height;
-    let flare = geo.notch_flare;
-    let shoulder = geo.notch_shoulder;
-    let radius = geo.bottom_radius.min(width / 2.0).min(height / 2.0);
+    let top_radius = geo.top_radius.min(width / 2.0).min(height / 2.0);
+    let bottom_radius = geo.bottom_radius.min(width / 2.0).min(height / 2.0);
+    let flare = geo.notch_flare.min(width / 2.0);
+    let shoulder = geo.notch_shoulder.min(height / 2.0);
+
+    // The lip and the rounded pill corner share one continuous corner curve.
+    // As the mode mix grows, the lip collapses (flare -> 0) while the corner
+    // radius opens up, so there is no topology swap and no visible pop.
+    let top_edge_left = x - flare + top_radius;
+    let top_edge_right = x + width + flare - top_radius;
+    let drop = shoulder.max(top_radius);
     let mut pb = PathBuilder::new();
 
-    pb.move_to(x - flare, y);
-    pb.line_to(x + width + flare, y);
+    pb.move_to(top_edge_left, y);
+    pb.line_to(top_edge_right, y);
     pb.cubic_to(
-        x + width + flare,
-        y + shoulder * 0.56,
+        top_edge_right + (x + width - top_edge_right) * CORNER_K,
+        y,
         x + width,
-        y + shoulder * 0.18,
+        y + drop * (1.0 - CORNER_K),
         x + width,
-        y + shoulder,
+        y + drop,
     );
-    pb.line_to(x + width, y + height - radius);
-    pb.quad_to(x + width, y + height, x + width - radius, y + height);
-    pb.line_to(x + radius, y + height);
-    pb.quad_to(x, y + height, x, y + height - radius);
-    pb.line_to(x, y + shoulder);
+    pb.line_to(x + width, y + height - bottom_radius);
+    pb.cubic_to(
+        x + width,
+        y + height - bottom_radius + bottom_radius * CORNER_K,
+        x + width - bottom_radius + bottom_radius * CORNER_K,
+        y + height,
+        x + width - bottom_radius,
+        y + height,
+    );
+    pb.line_to(x + bottom_radius, y + height);
+    pb.cubic_to(
+        x + bottom_radius - bottom_radius * CORNER_K,
+        y + height,
+        x,
+        y + height - bottom_radius + bottom_radius * CORNER_K,
+        x,
+        y + height - bottom_radius,
+    );
+    pb.line_to(x, y + drop);
     pb.cubic_to(
         x,
-        y + shoulder * 0.18,
-        x - flare,
-        y + shoulder * 0.56,
-        x - flare,
+        y + drop * (1.0 - CORNER_K),
+        top_edge_left + (x - top_edge_left) * CORNER_K,
+        y,
+        top_edge_left,
         y,
     );
-    pb.close();
-    pb.finish()
-}
-
-fn rounded_rect_path(
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
-    top_radius: f32,
-    bottom_radius: f32,
-) -> Option<Path> {
-    let top_radius = top_radius.min(width / 2.0).min(height / 2.0);
-    let bottom_radius = bottom_radius.min(width / 2.0).min(height / 2.0);
-    let mut pb = PathBuilder::new();
-
-    pb.move_to(x + top_radius, y);
-    pb.line_to(x + width - top_radius, y);
-    if top_radius > 0.01 {
-        pb.quad_to(x + width, y, x + width, y + top_radius);
-    } else {
-        pb.line_to(x + width, y);
-    }
-    pb.line_to(x + width, y + height - bottom_radius);
-    if bottom_radius > 0.01 {
-        pb.quad_to(x + width, y + height, x + width - bottom_radius, y + height);
-    } else {
-        pb.line_to(x + width, y + height);
-    }
-    pb.line_to(x + bottom_radius, y + height);
-    if bottom_radius > 0.01 {
-        pb.quad_to(x, y + height, x, y + height - bottom_radius);
-    } else {
-        pb.line_to(x, y + height);
-    }
-    pb.line_to(x, y + top_radius);
-    if top_radius > 0.01 {
-        pb.quad_to(x, y, x + top_radius, y);
-    }
     pb.close();
     pb.finish()
 }
@@ -324,9 +371,16 @@ fn draw_line(pixmap: &mut Pixmap, x1: f32, y1: f32, x2: f32, y2: f32, color: Col
 }
 
 pub fn measure_text(font: &Font, text: &str, size: f32) -> f32 {
-    text.chars()
-        .map(|ch| font.metrics(ch, size).advance_width)
-        .sum()
+    let mut width = 0.0;
+    let mut previous: Option<char> = None;
+    for ch in text.chars() {
+        if let Some(prev) = previous {
+            width += font.horizontal_kern(prev, ch, size).unwrap_or(0.0);
+        }
+        width += font.metrics(ch, size).advance_width;
+        previous = Some(ch);
+    }
+    width
 }
 
 fn draw_text(
@@ -339,7 +393,11 @@ fn draw_text(
     color: ColorU8,
 ) {
     let mut pen_x = x;
+    let mut previous: Option<char> = None;
     for ch in text.chars() {
+        if let Some(prev) = previous {
+            pen_x += font.horizontal_kern(prev, ch, size).unwrap_or(0.0);
+        }
         let (metrics, bitmap) = font.rasterize(ch, size);
         let glyph_x = (pen_x + metrics.xmin as f32).round() as i32;
         let glyph_y = (baseline - metrics.height as f32 - metrics.ymin as f32).round() as i32;
@@ -359,6 +417,7 @@ fn draw_text(
             }
         }
         pen_x += metrics.advance_width;
+        previous = Some(ch);
     }
 }
 
@@ -382,6 +441,58 @@ fn blend_pixel(pixmap: &mut Pixmap, x: i32, y: i32, color: ColorU8, coverage: u8
     data[index + 1] = (src_g + (data[index + 1] as u32 * inv) / 255) as u8;
     data[index + 2] = (src_b + (data[index + 2] as u32 * inv) / 255) as u8;
     data[index + 3] = (src_a + (data[index + 3] as u32 * inv) / 255) as u8;
+}
+
+fn composite_layer(dst: &mut Pixmap, src: &Pixmap, opacity: f32) {
+    let opacity = (opacity.clamp(0.0, 1.0) * 255.0).round() as u32;
+    if opacity == 0 {
+        return;
+    }
+
+    let dst_data = dst.data_mut();
+    let src_data = src.data();
+    debug_assert_eq!(dst_data.len(), src_data.len());
+
+    for i in (0..src_data.len()).step_by(4) {
+        let src_alpha = src_data[i + 3] as u32 * opacity / 255;
+        if src_alpha == 0 {
+            continue;
+        }
+        let inv = 255 - src_alpha;
+        dst_data[i] =
+            ((src_data[i] as u32 * opacity / 255) + (dst_data[i] as u32 * inv / 255)) as u8;
+        dst_data[i + 1] =
+            ((src_data[i + 1] as u32 * opacity / 255) + (dst_data[i + 1] as u32 * inv / 255)) as u8;
+        dst_data[i + 2] =
+            ((src_data[i + 2] as u32 * opacity / 255) + (dst_data[i + 2] as u32 * inv / 255)) as u8;
+        dst_data[i + 3] = (src_alpha + (dst_data[i + 3] as u32 * inv / 255)) as u8;
+    }
+}
+
+fn clip_to_shape(content: &mut Pixmap, shape: &Pixmap, threshold: u8) {
+    let content_data = content.data_mut();
+    let shape_data = shape.data();
+    debug_assert_eq!(content_data.len(), shape_data.len());
+
+    for i in (0..content_data.len()).step_by(4) {
+        if shape_data[i + 3] < threshold {
+            content_data[i..i + 4].fill(0);
+        }
+    }
+}
+
+fn scale_alpha(color: ColorU8, factor: f32) -> ColorU8 {
+    ColorU8::from_rgba(
+        color.red(),
+        color.green(),
+        color.blue(),
+        (color.alpha() as f32 * factor.clamp(0.0, 1.0)).round() as u8,
+    )
+}
+
+fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
+    let t = ((value - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 fn blend_color(a: ColorU8, b: ColorU8, t: f32) -> ColorU8 {
