@@ -10,6 +10,7 @@ const CORNER_K: f32 = 0.58;
 const SURFACE: ColorU8 = ColorU8::from_rgba(0, 0, 0, 255);
 const TEXT: ColorU8 = ColorU8::from_rgba(245, 244, 240, 250);
 const MUTED: ColorU8 = ColorU8::from_rgba(158, 157, 152, 205);
+#[allow(dead_code)]
 const HAIRLINE: ColorU8 = ColorU8::from_rgba(255, 255, 255, 10);
 const GREEN: ColorU8 = ColorU8::from_rgba(102, 224, 151, 255);
 
@@ -68,21 +69,6 @@ fn draw_shape(pixmap: &mut Pixmap, view: &IslandView<'_>) {
         SURFACE.alpha(),
     ));
     pixmap.fill_path(&path, &fill, FillRule::Winding, Transform::identity(), None);
-
-    // A hairline keeps the capsule legible on light wallpapers without the
-    // hard offset shadow the old HUD used.
-    let mut border = Paint::default();
-    border.set_color(Color::from_rgba8(
-        HAIRLINE.red(),
-        HAIRLINE.green(),
-        HAIRLINE.blue(),
-        HAIRLINE.alpha(),
-    ));
-    let stroke = Stroke {
-        width: 1.0 * view.scale,
-        ..Default::default()
-    };
-    pixmap.stroke_path(&path, &border, &stroke, Transform::identity(), None);
 }
 
 fn draw_content(pixmap: &mut Pixmap, view: &IslandView<'_>) {
