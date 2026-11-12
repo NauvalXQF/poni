@@ -5,7 +5,8 @@ A native Windows notch/pill island. Built with Rust, tiny-skia, and the Win32 AP
 ## What works
 
 - Two shapes: **Notch** (attached to the top edge) and **Pill** (floating just below it).
-- Idle HUD: clock, CPU usage, and battery percentage/icon.
+- Idle HUD: clock, CPU usage, and a white battery indicator with green charging bolt.
+- Transient notices for Wi-Fi connection + SSID, Bluetooth device connection, and airplane mode changes.
 - Hover expands the island; move away to collapse it.
 - Left-click pins/unpins the expanded state.
 - Right-click toggles Notch/Pill.

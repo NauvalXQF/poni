@@ -10,11 +10,15 @@ use std::time::{Duration, Instant};
 
 use chrono::Local;
 use fontdue::{Font, FontSettings};
-use geometry::{geometry, IslandMode, WINDOW_HEIGHT, WINDOW_WIDTH};
-use island::{draw as draw_island, IslandView};
+use geometry::{geometry_with_notice, IslandMode, WINDOW_HEIGHT, WINDOW_WIDTH};
+use island::{draw as draw_island, IslandView, NoticeKind};
 use serde::{Deserialize, Serialize};
 use tiny_skia::Pixmap;
 use windows::core::{w, PCWSTR};
+use windows::Win32::Devices::Bluetooth::{
+    BluetoothFindDeviceClose, BluetoothFindFirstDevice, BluetoothFindNextDevice,
+    BLUETOOTH_DEVICE_INFO, BLUETOOTH_DEVICE_SEARCH_PARAMS,
+};
 use windows::Win32::Foundation::{
     CloseHandle, BOOL, COLORREF, FILETIME, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT,
     SIZE, WAIT_OBJECT_0, WPARAM,
@@ -26,11 +30,16 @@ use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS,
     HDC, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
 };
+use windows::Win32::NetworkManagement::WiFi::{
+    wlan_interface_state_connected, wlan_intf_opcode_current_connection, WlanCloseHandle,
+    WlanEnumInterfaces, WlanFreeMemory, WlanOpenHandle, WlanQueryInterface,
+    WLAN_CONNECTION_ATTRIBUTES, WLAN_INTERFACE_INFO_LIST,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
 use windows::Win32::System::Registry::{
     RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
-    HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_SZ,
+    HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_DWORD, REG_SZ,
 };
 use windows::Win32::System::Threading::{
     CreateWaitableTimerExW, GetSystemTimes, SetWaitableTimer,
@@ -111,7 +120,21 @@ struct Fonts {
 struct BatteryStatus {
     percent: Option<u8>,
     charging: bool,
-    plugged: bool,
+}
+
+#[derive(Clone)]
+struct Notice {
+    kind: NoticeKind,
+    title: String,
+    subtitle: String,
+    until: Instant,
+}
+
+#[derive(Default, Clone, PartialEq, Eq)]
+struct NetworkState {
+    wifi: Option<String>,
+    bluetooth: Vec<String>,
+    airplane: bool,
 }
 
 #[derive(Default)]
@@ -235,7 +258,140 @@ fn battery_status() -> BatteryStatus {
     BatteryStatus {
         percent,
         charging: status.BatteryFlag & 8 != 0,
-        plugged: status.ACLineStatus == 1,
+    }
+}
+
+unsafe fn current_wifi_ssid() -> Option<String> {
+    let mut negotiated = 0u32;
+    let mut client = HANDLE::default();
+    if WlanOpenHandle(2, None, &mut negotiated, &mut client) != 0 {
+        return None;
+    }
+
+    let mut list: *mut WLAN_INTERFACE_INFO_LIST = null_mut();
+    if WlanEnumInterfaces(client, None, &mut list) != 0 || list.is_null() {
+        let _ = WlanCloseHandle(client, None);
+        return None;
+    }
+
+    let mut result = None;
+    let count = (*list).dwNumberOfItems as usize;
+    for index in 0..count {
+        let info = &*(*list).InterfaceInfo.as_ptr().add(index);
+        if info.isState != wlan_interface_state_connected {
+            continue;
+        }
+
+        let mut data_size = 0u32;
+        let mut data: *mut c_void = null_mut();
+        if WlanQueryInterface(
+            client,
+            &info.InterfaceGuid,
+            wlan_intf_opcode_current_connection,
+            None,
+            &mut data_size,
+            &mut data,
+            None,
+        ) != 0
+            || data.is_null()
+        {
+            continue;
+        }
+
+        let attrs = &*(data as *const WLAN_CONNECTION_ATTRIBUTES);
+        if attrs.isState == wlan_interface_state_connected {
+            let ssid = &attrs.wlanAssociationAttributes.dot11Ssid;
+            let length = (ssid.uSSIDLength as usize).min(ssid.ucSSID.len());
+            if length > 0 {
+                result = Some(String::from_utf8_lossy(&ssid.ucSSID[..length]).to_string());
+            }
+        }
+        WlanFreeMemory(data);
+
+        if result.is_some() {
+            break;
+        }
+    }
+
+    WlanFreeMemory(list.cast());
+    let _ = WlanCloseHandle(client, None);
+    result
+}
+
+unsafe fn connected_bluetooth_devices() -> Vec<String> {
+    let params = BLUETOOTH_DEVICE_SEARCH_PARAMS {
+        dwSize: std::mem::size_of::<BLUETOOTH_DEVICE_SEARCH_PARAMS>() as u32,
+        fReturnAuthenticated: BOOL(1),
+        fReturnRemembered: BOOL(1),
+        fReturnUnknown: BOOL(0),
+        fReturnConnected: BOOL(1),
+        fIssueInquiry: BOOL(0),
+        cTimeoutMultiplier: 0,
+        hRadio: HANDLE::default(),
+    };
+    let mut info = BLUETOOTH_DEVICE_INFO::default();
+    info.dwSize = std::mem::size_of::<BLUETOOTH_DEVICE_INFO>() as u32;
+
+    let Ok(find) = BluetoothFindFirstDevice(&params, &mut info) else {
+        return Vec::new();
+    };
+
+    let mut devices = Vec::new();
+    loop {
+        if info.fConnected.as_bool() {
+            let name = wide_string(&info.szName);
+            if !name.is_empty() && !devices.contains(&name) {
+                devices.push(name);
+            }
+        }
+        if BluetoothFindNextDevice(find, &mut info).is_err() {
+            break;
+        }
+    }
+    let _ = BluetoothFindDeviceClose(find);
+    devices
+}
+
+fn wide_string(value: &[u16]) -> String {
+    let length = value
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(value.len());
+    String::from_utf16_lossy(&value[..length])
+}
+
+fn airplane_mode_enabled() -> bool {
+    const KEY: PCWSTR = w!("SYSTEM\\CurrentControlSet\\Control\\RadioManagement\\SystemRadioState");
+    unsafe {
+        let mut key = HKEY::default();
+        if RegOpenKeyExW(HKEY_LOCAL_MACHINE, KEY, 0, KEY_QUERY_VALUE, &mut key).0 != 0 {
+            return false;
+        }
+
+        let mut value = 0u32;
+        let mut value_type = REG_DWORD;
+        let mut size = std::mem::size_of::<u32>() as u32;
+        let mut status = RegQueryValueExW(
+            key,
+            w!(""),
+            None,
+            Some(&mut value_type),
+            Some((&mut value as *mut u32).cast()),
+            Some(&mut size),
+        );
+        if status.0 != 0 {
+            size = std::mem::size_of::<u32>() as u32;
+            status = RegQueryValueExW(
+                key,
+                w!("SystemRadioState"),
+                None,
+                Some(&mut value_type),
+                Some((&mut value as *mut u32).cast()),
+                Some(&mut size),
+            );
+        }
+        let _ = RegCloseKey(key);
+        status.0 == 0 && value != 0
     }
 }
 
@@ -259,6 +415,10 @@ struct App {
     battery: BatteryStatus,
     cpu_sampler: CpuSampler,
     last_status_update: Instant,
+    network: NetworkState,
+    network_initialized: bool,
+    notice: Option<Notice>,
+    notice_mix: f32,
     hidden_for_fullscreen: bool,
     last_fullscreen_check: Instant,
     timer: HANDLE,
@@ -292,6 +452,10 @@ impl App {
             battery: BatteryStatus::default(),
             cpu_sampler: CpuSampler::default(),
             last_status_update: Instant::now(),
+            network: NetworkState::default(),
+            network_initialized: false,
+            notice: None,
+            notice_mix: 0.0,
             hidden_for_fullscreen: false,
             last_fullscreen_check: Instant::now(),
             timer,
@@ -381,9 +545,10 @@ impl App {
     }
 
     fn geometry(&self) -> geometry::Geometry {
-        geometry(
+        geometry_with_notice(
             self.mode_mix,
             self.progress,
+            self.notice_mix,
             self.effective_scale(),
             self.window_width as f32,
         )
@@ -447,7 +612,66 @@ impl App {
             changed = true;
         }
 
+        self.update_network_state();
         changed
+    }
+
+    fn show_notice(&mut self, kind: NoticeKind, title: &str, subtitle: String) {
+        if self.hidden_for_fullscreen {
+            return;
+        }
+        self.notice = Some(Notice {
+            kind,
+            title: title.to_string(),
+            subtitle,
+            until: Instant::now() + Duration::from_secs(3),
+        });
+        self.request_frame();
+    }
+
+    fn update_network_state(&mut self) {
+        let current = NetworkState {
+            wifi: unsafe { current_wifi_ssid() },
+            bluetooth: unsafe { connected_bluetooth_devices() },
+            airplane: airplane_mode_enabled(),
+        };
+
+        if !self.network_initialized {
+            self.network = current;
+            self.network_initialized = true;
+            return;
+        }
+
+        let new_wifi = if current.wifi != self.network.wifi {
+            current.wifi.clone()
+        } else {
+            None
+        };
+        let new_bluetooth = current
+            .bluetooth
+            .iter()
+            .find(|device| !self.network.bluetooth.contains(device))
+            .cloned();
+        let airplane_changed = current.airplane != self.network.airplane;
+
+        if let Some(ssid) = new_wifi {
+            self.show_notice(NoticeKind::Wifi, "Wi-Fi terhubung", ssid);
+        } else if let Some(device) = new_bluetooth {
+            self.show_notice(NoticeKind::Bluetooth, "Bluetooth terhubung", device);
+        } else if airplane_changed {
+            self.show_notice(
+                NoticeKind::Airplane,
+                "Mode pesawat",
+                if current.airplane {
+                    "Aktif"
+                } else {
+                    "Nonaktif"
+                }
+                .to_string(),
+            );
+        }
+
+        self.network = current;
     }
 
     unsafe fn tick(&mut self) {
@@ -478,10 +702,21 @@ impl App {
             self.time = clock;
             changed = true;
         }
+        if self
+            .notice
+            .as_ref()
+            .is_some_and(|notice| now >= notice.until)
+        {
+            self.notice = None;
+        }
+        let notice_target = if self.notice.is_some() { 1.0 } else { 0.0 };
         if approach(&mut self.progress, target, dt, ANIMATION_RATE) {
             changed = true;
         }
         if approach(&mut self.mode_mix, target_mode, dt, MODE_RATE) {
+            changed = true;
+        }
+        if approach(&mut self.notice_mix, notice_target, dt, 22.0) {
             changed = true;
         }
 
@@ -502,8 +737,10 @@ impl App {
         } else {
             0.0
         };
+        let notice_target = if self.notice.is_some() { 1.0 } else { 0.0 };
         let animating = (self.progress - target).abs() > 0.002
-            || (self.mode_mix - self.mode.mix()).abs() > 0.002;
+            || (self.mode_mix - self.mode.mix()).abs() > 0.002
+            || (self.notice_mix - notice_target).abs() > 0.002;
 
         if animating {
             1000.0 / self.refresh_hz.max(30.0)
@@ -532,7 +769,10 @@ impl App {
             cpu_percent: self.cpu_percent,
             battery_percent: self.battery.percent,
             battery_charging: self.battery.charging,
-            battery_plugged: self.battery.plugged,
+            notice_mix: self.notice_mix,
+            notice_kind: self.notice.as_ref().map(|notice| notice.kind),
+            notice_title: self.notice.as_ref().map(|notice| notice.title.as_str()),
+            notice_subtitle: self.notice.as_ref().map(|notice| notice.subtitle.as_str()),
             regular: self.fonts.regular.as_ref(),
             semibold: self.fonts.semibold.as_ref(),
         };

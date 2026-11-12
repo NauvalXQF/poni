@@ -4,6 +4,14 @@ use tiny_skia::{Color, ColorU8, FillRule, Paint, Path, PathBuilder, Pixmap, Stro
 use crate::geometry::{lerp, Geometry, IslandMode};
 
 const CORNER_K: f32 = 0.552_284_8;
+const GREEN: ColorU8 = ColorU8::from_rgba(102, 224, 151, 255);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum NoticeKind {
+    Wifi,
+    Bluetooth,
+    Airplane,
+}
 
 pub struct IslandView<'a> {
     pub mode: IslandMode,
@@ -16,7 +24,10 @@ pub struct IslandView<'a> {
     pub cpu_percent: Option<u8>,
     pub battery_percent: Option<u8>,
     pub battery_charging: bool,
-    pub battery_plugged: bool,
+    pub notice_mix: f32,
+    pub notice_kind: Option<NoticeKind>,
+    pub notice_title: Option<&'a str>,
+    pub notice_subtitle: Option<&'a str>,
     pub regular: Option<&'a Font>,
     pub semibold: Option<&'a Font>,
 }
@@ -96,14 +107,18 @@ fn draw_content(pixmap: &mut Pixmap, view: &IslandView<'_>) {
     let muted = ColorU8::from_rgba(190, 184, 174, 185);
 
     let content_mix = smoothstep(0.35, 0.72, view.progress);
-    let collapsed_alpha = 1.0 - content_mix;
-    let expanded_alpha = content_mix;
+    let normal_alpha = 1.0 - view.notice_mix;
+    let collapsed_alpha = (1.0 - content_mix) * normal_alpha;
+    let expanded_alpha = content_mix * normal_alpha;
 
     if collapsed_alpha > 0.01 {
-        draw_collapsed(pixmap, view, collapsed_alpha, accent, cream, muted);
+        draw_collapsed(pixmap, view, collapsed_alpha, cream, muted);
     }
     if expanded_alpha > 0.01 {
         draw_expanded(pixmap, view, expanded_alpha, accent, cream, muted);
+    }
+    if view.notice_mix > 0.01 {
+        draw_notice(pixmap, view, cream, muted);
     }
 }
 
@@ -111,7 +126,6 @@ fn draw_collapsed(
     pixmap: &mut Pixmap,
     view: &IslandView<'_>,
     alpha: f32,
-    accent: ColorU8,
     cream: ColorU8,
     muted: ColorU8,
 ) {
@@ -159,13 +173,6 @@ fn draw_collapsed(
     let battery_text_size = 10.0 * s;
     let battery_text_width = measure_text(semibold, &battery_text, battery_text_size);
     let battery_text_x = right - battery_text_width;
-    let battery_color = if view.battery_charging || view.battery_plugged {
-        accent
-    } else if view.battery_percent.is_some_and(|percent| percent <= 20) {
-        accent
-    } else {
-        cream
-    };
     draw_text(
         pixmap,
         semibold,
@@ -173,7 +180,7 @@ fn draw_collapsed(
         battery_text_x,
         baseline,
         battery_text_size,
-        scale_alpha(battery_color, alpha),
+        scale_alpha(cream, alpha),
     );
 
     let icon_width = 19.0 * s;
@@ -189,8 +196,209 @@ fn draw_collapsed(
         view.battery_percent,
         view.battery_charging,
         alpha,
-        battery_color,
+        cream,
+        GREEN,
     );
+}
+
+fn draw_notice(pixmap: &mut Pixmap, view: &IslandView<'_>, cream: ColorU8, muted: ColorU8) {
+    let (Some(kind), Some(title), Some(subtitle)) =
+        (view.notice_kind, view.notice_title, view.notice_subtitle)
+    else {
+        return;
+    };
+    let Some(regular) = view.regular.or(view.semibold) else {
+        return;
+    };
+    let semibold = view.semibold.unwrap_or(regular);
+    let s = view.scale;
+    let geo = view.geometry;
+    let alpha = view.notice_mix;
+    let icon_x = geo.x + 21.0 * s;
+    let center_y = geo.y + geo.height / 2.0;
+    draw_notice_icon(
+        pixmap,
+        kind,
+        icon_x,
+        center_y,
+        20.0 * s,
+        scale_alpha(cream, alpha),
+    );
+
+    draw_text(
+        pixmap,
+        semibold,
+        title,
+        geo.x + 48.0 * s,
+        geo.y + 26.0 * s,
+        12.5 * s,
+        scale_alpha(cream, alpha),
+    );
+    draw_text(
+        pixmap,
+        regular,
+        subtitle,
+        geo.x + 48.0 * s,
+        geo.y + 45.0 * s,
+        10.5 * s,
+        scale_alpha(muted, alpha),
+    );
+}
+
+fn draw_notice_icon(
+    pixmap: &mut Pixmap,
+    kind: NoticeKind,
+    cx: f32,
+    cy: f32,
+    size: f32,
+    color: ColorU8,
+) {
+    match kind {
+        NoticeKind::Wifi => draw_wifi_icon(pixmap, cx, cy, size, color),
+        NoticeKind::Bluetooth => draw_bluetooth_icon(pixmap, cx, cy, size, color),
+        NoticeKind::Airplane => draw_airplane_icon(pixmap, cx, cy, size, color),
+    }
+}
+
+fn draw_wifi_icon(pixmap: &mut Pixmap, cx: f32, cy: f32, size: f32, color: ColorU8) {
+    let center_y = cy + size * 0.22;
+    for radius in [size * 0.42, size * 0.29, size * 0.16] {
+        draw_arc(
+            pixmap,
+            cx,
+            center_y,
+            radius,
+            205.0,
+            335.0,
+            color,
+            (size * 0.075).max(1.0),
+        );
+    }
+    draw_filled_circle(pixmap, cx, center_y, size * 0.055, color);
+}
+
+fn draw_bluetooth_icon(pixmap: &mut Pixmap, cx: f32, cy: f32, size: f32, color: ColorU8) {
+    let height = size * 0.42;
+    let width = size * 0.20;
+    let mut pb = PathBuilder::new();
+    pb.move_to(cx, cy - height);
+    pb.line_to(cx, cy + height);
+    pb.move_to(cx, cy - height);
+    pb.line_to(cx + width, cy - height * 0.5);
+    pb.line_to(cx - width, cy);
+    pb.line_to(cx + width, cy + height * 0.5);
+    pb.line_to(cx, cy + height);
+    if let Some(path) = pb.finish() {
+        let mut paint = Paint::default();
+        paint.set_color(Color::from_rgba8(
+            color.red(),
+            color.green(),
+            color.blue(),
+            color.alpha(),
+        ));
+        let stroke = Stroke {
+            width: (size * 0.075).max(1.0),
+            ..Default::default()
+        };
+        pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+    }
+}
+
+fn draw_airplane_icon(pixmap: &mut Pixmap, cx: f32, cy: f32, size: f32, color: ColorU8) {
+    let s = size * 0.5;
+    let mut pb = PathBuilder::new();
+    pb.move_to(cx, cy - s);
+    pb.line_to(cx + s * 0.16, cy - s);
+    pb.line_to(cx + s * 0.16, cy - s * 0.15);
+    pb.line_to(cx + s, cy + s * 0.25);
+    pb.line_to(cx + s, cy + s * 0.42);
+    pb.line_to(cx + s * 0.16, cy + s * 0.16);
+    pb.line_to(cx + s * 0.16, cy + s * 0.78);
+    pb.line_to(cx + s * 0.42, cy + s);
+    pb.line_to(cx - s * 0.42, cy + s);
+    pb.line_to(cx - s * 0.16, cy + s * 0.78);
+    pb.line_to(cx - s * 0.16, cy + s * 0.16);
+    pb.line_to(cx - s, cy + s * 0.42);
+    pb.line_to(cx - s, cy + s * 0.25);
+    pb.line_to(cx - s * 0.16, cy - s * 0.15);
+    pb.line_to(cx - s * 0.16, cy - s);
+    pb.close();
+    if let Some(path) = pb.finish() {
+        let mut paint = Paint::default();
+        paint.set_color(Color::from_rgba8(
+            color.red(),
+            color.green(),
+            color.blue(),
+            color.alpha(),
+        ));
+        pixmap.fill_path(
+            &path,
+            &paint,
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
+    }
+}
+
+fn draw_arc(
+    pixmap: &mut Pixmap,
+    cx: f32,
+    cy: f32,
+    radius: f32,
+    start_deg: f32,
+    end_deg: f32,
+    color: ColorU8,
+    width: f32,
+) {
+    let mut pb = PathBuilder::new();
+    let steps = 16;
+    for step in 0..=steps {
+        let t = step as f32 / steps as f32;
+        let angle = (start_deg + (end_deg - start_deg) * t).to_radians();
+        let x = cx + radius * angle.cos();
+        let y = cy + radius * angle.sin();
+        if step == 0 {
+            pb.move_to(x, y);
+        } else {
+            pb.line_to(x, y);
+        }
+    }
+    if let Some(path) = pb.finish() {
+        let mut paint = Paint::default();
+        paint.set_color(Color::from_rgba8(
+            color.red(),
+            color.green(),
+            color.blue(),
+            color.alpha(),
+        ));
+        let stroke = Stroke {
+            width,
+            ..Default::default()
+        };
+        pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+    }
+}
+
+fn draw_filled_circle(pixmap: &mut Pixmap, cx: f32, cy: f32, radius: f32, color: ColorU8) {
+    let mut pb = PathBuilder::new();
+    pb.push_circle(cx, cy, radius);
+    if let Some(path) = pb.finish() {
+        let mut paint = Paint::default();
+        paint.set_color(Color::from_rgba8(
+            color.red(),
+            color.green(),
+            color.blue(),
+            color.alpha(),
+        ));
+        pixmap.fill_path(
+            &path,
+            &paint,
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
+    }
 }
 
 fn draw_expanded(
@@ -404,6 +612,7 @@ fn draw_battery(
     charging: bool,
     alpha: f32,
     color: ColorU8,
+    charging_color: ColorU8,
 ) {
     let s = height / 10.0;
     let nub_width = width * 0.10;
@@ -481,7 +690,7 @@ fn draw_battery(
             x + body_width / 2.0,
             y + height / 2.0,
             height * 0.58,
-            scale_alpha(color, alpha),
+            scale_alpha(charging_color, alpha),
         );
     }
 }

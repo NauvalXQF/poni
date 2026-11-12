@@ -7,6 +7,8 @@ pub const COLLAPSED_WIDTH: f32 = 220.0;
 pub const COLLAPSED_HEIGHT: f32 = 34.0;
 pub const EXPANDED_WIDTH: f32 = 430.0;
 pub const EXPANDED_HEIGHT: f32 = 176.0;
+pub const NOTICE_WIDTH: f32 = 330.0;
+pub const NOTICE_HEIGHT: f32 = 62.0;
 
 /// How far the notch lip reaches past the body on each side, in logical pixels.
 pub const NOTCH_FLARE: f32 = 20.0;
@@ -68,12 +70,32 @@ pub struct Geometry {
     pub notch_shoulder: f32,
 }
 
+#[allow(dead_code)]
 pub fn geometry(mode_mix: f32, progress: f32, scale: f32, window_width: f32) -> Geometry {
+    geometry_with_notice(mode_mix, progress, 0.0, scale, window_width)
+}
+
+pub fn geometry_with_notice(
+    mode_mix: f32,
+    progress: f32,
+    notice_mix: f32,
+    scale: f32,
+    window_width: f32,
+) -> Geometry {
     let mode_mix = mode_mix.clamp(0.0, 1.0);
     let progress = progress.clamp(0.0, 1.0);
+    let notice_mix = notice_mix.clamp(0.0, 1.0);
 
-    let width = lerp(COLLAPSED_WIDTH, EXPANDED_WIDTH, progress) * scale;
-    let height = lerp(COLLAPSED_HEIGHT, EXPANDED_HEIGHT, progress) * scale;
+    let width = lerp(
+        lerp(COLLAPSED_WIDTH, EXPANDED_WIDTH, progress),
+        NOTICE_WIDTH,
+        notice_mix,
+    ) * scale;
+    let height = lerp(
+        lerp(COLLAPSED_HEIGHT, EXPANDED_HEIGHT, progress),
+        NOTICE_HEIGHT,
+        notice_mix,
+    ) * scale;
     let x = (window_width - width) / 2.0;
     let y = lerp(0.0, 10.0, mode_mix) * scale;
     let pill_radius = lerp(17.0, 26.0, progress) * scale;
