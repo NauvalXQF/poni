@@ -19,7 +19,8 @@ use serde::{Deserialize, Serialize};
 use surface::LayeredSurface;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, BOOL, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WAIT_OBJECT_0, WPARAM,
+    CloseHandle, GetLastError, BOOL, ERROR_ALREADY_EXISTS, HANDLE, HINSTANCE, HWND, LPARAM,
+    LRESULT, POINT, RECT, WAIT_OBJECT_0, WPARAM,
 };
 use windows::Win32::Graphics::Dwm::{DwmGetCompositionTimingInfo, DWM_TIMING_INFO};
 use windows::Win32::Graphics::Gdi::{
@@ -33,8 +34,8 @@ use windows::Win32::System::Registry::{
     HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_SZ,
 };
 use windows::Win32::System::Threading::{
-    CreateWaitableTimerExW, SetWaitableTimer, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, INFINITE,
-    TIMER_ALL_ACCESS,
+    CreateMutexW, CreateWaitableTimerExW, SetWaitableTimer, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+    INFINITE, TIMER_ALL_ACCESS,
 };
 use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -472,17 +473,24 @@ impl App {
             } else {
                 None
             };
-            let new_bluetooth = current
-                .bluetooth
-                .iter()
-                .find(|device| !self.network.bluetooth.contains(device))
-                .cloned();
+            let new_bluetooth = current.bluetooth.iter().find(|device| {
+                !self
+                    .network
+                    .bluetooth
+                    .iter()
+                    .any(|known| known.name == device.name)
+            });
             let airplane_changed = current.airplane != self.network.airplane;
 
             if let Some(ssid) = new_wifi {
                 self.show_notice(NoticeKind::Wifi, "Wi-Fi terhubung", ssid);
             } else if let Some(device) = new_bluetooth {
-                self.show_notice(NoticeKind::Bluetooth, "Bluetooth terhubung", device);
+                self.show_notice_with_battery(
+                    NoticeKind::Bluetooth,
+                    "Bluetooth terhubung",
+                    device.name.clone(),
+                    device.battery,
+                );
             } else if airplane_changed {
                 self.show_notice(
                     NoticeKind::Airplane,
@@ -626,6 +634,13 @@ impl App {
         let Some(surface) = self.surface.take() else {
             return;
         };
+        let bluetooth_label = self.network.bluetooth.first().map(|device| {
+            if let Some(battery) = device.battery {
+                format!("{} {}%", device.name, battery)
+            } else {
+                device.name.clone()
+            }
+        });
         let view = IslandView {
             progress: self.progress,
             geometry: self.geometry(),
@@ -635,11 +650,7 @@ impl App {
             battery_percent: self.battery.percent,
             battery_charging: self.battery.charging,
             wifi: self.network.wifi.as_deref(),
-            bluetooth: self
-                .network
-                .bluetooth
-                .first()
-                .map(std::string::String::as_str),
+            bluetooth: bluetooth_label.as_deref(),
             notice_mix: self.notice_mix,
             notice_kind: self.notice.as_ref().map(|notice| notice.kind),
             notice_title: self.notice.as_ref().map(|notice| notice.title.as_str()),
@@ -652,7 +663,8 @@ impl App {
 
         if let Some(pixmap) = draw_island(surface.width as u32, surface.height as u32, &view) {
             if self.hit_mask.len() == (pixmap.width() * pixmap.height()) as usize {
-                for (dst, src) in self.hit_mask.iter_mut().zip(pixmap.data().chunks_exact(4)) {
+                let (pixels, _) = pixmap.data().as_chunks::<4>();
+                for (dst, src) in self.hit_mask.iter_mut().zip(pixels) {
                     *dst = if src[3] > 127 { 255 } else { 0 };
                 }
             }
@@ -699,13 +711,15 @@ impl App {
             }
         };
 
-        let mut data = NOTIFYICONDATAW::default();
-        data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-        data.hWnd = self.hwnd;
-        data.uID = TRAY_ID;
-        data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
-        data.uCallbackMessage = TRAY_MESSAGE;
-        data.hIcon = icon;
+        let mut data = NOTIFYICONDATAW {
+            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: self.hwnd,
+            uID: TRAY_ID,
+            uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
+            uCallbackMessage: TRAY_MESSAGE,
+            hIcon: icon,
+            ..Default::default()
+        };
         let tip: Vec<u16> = "Poni".encode_utf16().chain(std::iter::once(0)).collect();
         data.szTip[..tip.len()].copy_from_slice(&tip);
 
@@ -863,8 +877,10 @@ fn detect_refresh_rate() -> f32 {
     }
 
     unsafe {
-        let mut info = DWM_TIMING_INFO::default();
-        info.cbSize = std::mem::size_of::<DWM_TIMING_INFO>() as u32;
+        let mut info = DWM_TIMING_INFO {
+            cbSize: std::mem::size_of::<DWM_TIMING_INFO>() as u32,
+            ..Default::default()
+        };
         if DwmGetCompositionTimingInfo(None, &mut info).is_ok() && info.qpcRefreshPeriod > 0 {
             let hz = 10_000_000.0 / info.qpcRefreshPeriod as f32;
             if hz.is_finite() && (30.0..=240.0).contains(&hz) {
@@ -1130,6 +1146,19 @@ fn app_mut(hwnd: HWND) -> Option<&'static mut App> {
 fn main() {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+        let instance_mutex = match CreateMutexW(None, false, w!("Local\\PoniIsland")) {
+            Ok(handle) => handle,
+            Err(err) => {
+                log_line(&format!("CreateMutexW failed: {err}"));
+                return;
+            }
+        };
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            let _ = CloseHandle(instance_mutex);
+            return;
+        }
+
         let instance = match GetModuleHandleW(None) {
             Ok(instance) => instance,
             Err(err) => {
@@ -1237,5 +1266,6 @@ fn main() {
         }
 
         let _ = CloseHandle(timer);
+        let _ = CloseHandle(instance_mutex);
     }
 }

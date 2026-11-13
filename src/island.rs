@@ -473,6 +473,7 @@ fn draw_airplane_icon(pixmap: &mut Pixmap, cx: f32, cy: f32, size: f32, color: C
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_arc(
     pixmap: &mut Pixmap,
     cx: f32,
@@ -535,6 +536,7 @@ fn draw_filled_circle(pixmap: &mut Pixmap, cx: f32, cy: f32, radius: f32, color:
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_battery(
     pixmap: &mut Pixmap,
     cx: f32,

@@ -19,17 +19,12 @@ pub const NOTCH_FLARE: f32 = 10.0;
 /// How far the attached shoulder drops from the top edge, in logical pixels.
 pub const NOTCH_SHOULDER: f32 = 8.0;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ShapeStyle {
     Attached,
+    #[default]
     Floating,
-}
-
-impl Default for ShapeStyle {
-    fn default() -> Self {
-        Self::Floating
-    }
 }
 
 #[derive(Debug, Clone, Copy)]

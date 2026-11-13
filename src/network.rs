@@ -1,10 +1,18 @@
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr::null_mut;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::Duration;
 
-use windows::core::{w, PCWSTR};
+use windows::core::{w, Interface, HSTRING, PCWSTR};
+use windows::Devices::Bluetooth::BluetoothLEDevice;
+use windows::Devices::Bluetooth::GenericAttributeProfile::{
+    GattCharacteristicUuids, GattCommunicationStatus, GattServiceUuids,
+};
+use windows::Devices::Enumeration::DeviceInformation;
+use windows::Foundation::IPropertyValue;
+use windows::Storage::Streams::DataReader;
 use windows::Win32::Devices::Bluetooth::{
     BluetoothFindDeviceClose, BluetoothFindFirstDevice, BluetoothFindNextDevice,
     BLUETOOTH_DEVICE_INFO, BLUETOOTH_DEVICE_SEARCH_PARAMS,
@@ -15,6 +23,7 @@ use windows::Win32::NetworkManagement::WiFi::{
     WlanEnumInterfaces, WlanFreeMemory, WlanOpenHandle, WlanQueryInterface,
     WLAN_CONNECTION_ATTRIBUTES, WLAN_INTERFACE_INFO_LIST,
 };
+use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 use windows::Win32::System::Registry::{
     RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE,
     REG_DWORD,
@@ -23,9 +32,15 @@ use windows::Win32::System::Registry::{
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 
 #[derive(Default, Clone, PartialEq, Eq)]
+pub struct BluetoothDevice {
+    pub name: String,
+    pub battery: Option<u8>,
+}
+
+#[derive(Default, Clone, PartialEq, Eq)]
 pub struct NetworkState {
     pub wifi: Option<String>,
-    pub bluetooth: Vec<String>,
+    pub bluetooth: Vec<BluetoothDevice>,
     pub airplane: bool,
 }
 
@@ -33,16 +48,22 @@ pub struct NetworkState {
 /// enumeration can never stall the animation loop.
 pub fn spawn_worker() -> Receiver<NetworkState> {
     let (sender, receiver) = mpsc::channel();
-    thread::spawn(move || loop {
-        let state = NetworkState {
-            wifi: unsafe { current_wifi_ssid() },
-            bluetooth: unsafe { connected_bluetooth_devices() },
-            airplane: airplane_mode_enabled(),
-        };
-        if sender.send(state).is_err() {
-            break;
+    thread::spawn(move || {
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         }
-        thread::sleep(POLL_INTERVAL);
+        loop {
+            let batteries = bluetooth_battery_levels();
+            let state = NetworkState {
+                wifi: unsafe { current_wifi_ssid() },
+                bluetooth: unsafe { connected_bluetooth_devices(&batteries) },
+                airplane: airplane_mode_enabled(),
+            };
+            if sender.send(state).is_err() {
+                break;
+            }
+            thread::sleep(POLL_INTERVAL);
+        }
     });
     receiver
 }
@@ -104,7 +125,7 @@ unsafe fn current_wifi_ssid() -> Option<String> {
     result
 }
 
-unsafe fn connected_bluetooth_devices() -> Vec<String> {
+unsafe fn connected_bluetooth_devices(batteries: &HashMap<String, u8>) -> Vec<BluetoothDevice> {
     let params = BLUETOOTH_DEVICE_SEARCH_PARAMS {
         dwSize: std::mem::size_of::<BLUETOOTH_DEVICE_SEARCH_PARAMS>() as u32,
         fReturnAuthenticated: BOOL(1),
@@ -115,8 +136,10 @@ unsafe fn connected_bluetooth_devices() -> Vec<String> {
         cTimeoutMultiplier: 0,
         hRadio: HANDLE::default(),
     };
-    let mut info = BLUETOOTH_DEVICE_INFO::default();
-    info.dwSize = std::mem::size_of::<BLUETOOTH_DEVICE_INFO>() as u32;
+    let mut info = BLUETOOTH_DEVICE_INFO {
+        dwSize: std::mem::size_of::<BLUETOOTH_DEVICE_INFO>() as u32,
+        ..Default::default()
+    };
 
     let Ok(find) = BluetoothFindFirstDevice(&params, &mut info) else {
         return Vec::new();
@@ -126,8 +149,9 @@ unsafe fn connected_bluetooth_devices() -> Vec<String> {
     loop {
         if info.fConnected.as_bool() {
             let name = wide_string(&info.szName);
-            if !name.is_empty() && !devices.contains(&name) {
-                devices.push(name);
+            if !name.is_empty() && !devices.iter().any(|d: &BluetoothDevice| d.name == name) {
+                let battery = batteries.get(&name).copied();
+                devices.push(BluetoothDevice { name, battery });
             }
         }
         if BluetoothFindNextDevice(find, &mut info).is_err() {
@@ -136,6 +160,141 @@ unsafe fn connected_bluetooth_devices() -> Vec<String> {
     }
     let _ = BluetoothFindDeviceClose(find);
     devices
+}
+
+fn bluetooth_battery_levels() -> HashMap<String, u8> {
+    let mut map = HashMap::new();
+    // Best-effort: query connected Bluetooth devices and read battery
+    // properties exposed by Windows for some peripherals.
+    if let Ok(aqs) =
+        windows::Devices::Bluetooth::BluetoothDevice::GetDeviceSelectorFromConnectionStatus(
+            windows::Devices::Bluetooth::BluetoothConnectionStatus::Connected,
+        )
+    {
+        collect_bluetooth_batteries(&aqs, &mut map);
+    }
+    if let Ok(aqs_le) =
+        windows::Devices::Bluetooth::BluetoothLEDevice::GetDeviceSelectorFromConnectionStatus(
+            windows::Devices::Bluetooth::BluetoothConnectionStatus::Connected,
+        )
+    {
+        collect_bluetooth_batteries(&aqs_le, &mut map);
+    }
+    map
+}
+
+fn collect_bluetooth_batteries(aqs: &HSTRING, map: &mut HashMap<String, u8>) {
+    let Ok(collection) = DeviceInformation::FindAllAsyncAqsFilter(aqs).and_then(|op| op.get())
+    else {
+        return;
+    };
+    let Ok(count) = collection.Size() else {
+        return;
+    };
+    for i in 0..count {
+        let Ok(info) = collection.GetAt(i) else {
+            continue;
+        };
+        let Ok(name_h) = info.Name() else {
+            continue;
+        };
+        let name = name_h.to_string();
+        if name.is_empty() || map.contains_key(&name) {
+            continue;
+        }
+        let mut battery = info.Properties().ok().and_then(|properties| {
+            read_battery_property(&properties, "System.Devices.Aep.BatteryLevel")
+                .or_else(|| {
+                    read_battery_property(&properties, "System.Devices.Aep.BatteryPercentage")
+                })
+                .or_else(|| {
+                    read_battery_property(&properties, "{104EA319-6EE2-4701-BD47-8DDBF425BBE5} 2")
+                })
+        });
+        if battery.is_none() {
+            if let Ok(id) = info.Id() {
+                battery = read_gatt_battery_level(&id);
+            }
+        }
+        if let Some(level) = battery {
+            map.insert(name, level.min(100));
+        }
+    }
+}
+
+fn read_gatt_battery_level(device_id: &HSTRING) -> Option<u8> {
+    let device = BluetoothLEDevice::FromIdAsync(device_id).ok()?.get().ok()?;
+    let service_uuid = GattServiceUuids::Battery().ok()?;
+    let services_result = device
+        .GetGattServicesForUuidAsync(service_uuid)
+        .ok()?
+        .get()
+        .ok()?;
+    if services_result.Status().ok()? != GattCommunicationStatus::Success {
+        return None;
+    }
+    let services = services_result.Services().ok()?;
+    let count = services.Size().ok()?;
+    let char_uuid = GattCharacteristicUuids::BatteryLevel().ok()?;
+    for i in 0..count {
+        let service = services.GetAt(i).ok()?;
+        let chars_result = service
+            .GetCharacteristicsForUuidAsync(char_uuid)
+            .ok()?
+            .get()
+            .ok()?;
+        if chars_result.Status().ok()? != GattCommunicationStatus::Success {
+            continue;
+        }
+        let chars = chars_result.Characteristics().ok()?;
+        let char_count = chars.Size().ok()?;
+        for j in 0..char_count {
+            let characteristic = chars.GetAt(j).ok()?;
+            let read = characteristic.ReadValueAsync().ok()?.get().ok()?;
+            if read.Status().ok()? != GattCommunicationStatus::Success {
+                continue;
+            }
+            let buffer = read.Value().ok()?;
+            let len = buffer.Length().ok()? as usize;
+            if len == 0 {
+                continue;
+            }
+            let reader = DataReader::FromBuffer(&buffer).ok()?;
+            let level = reader.ReadByte().ok()?;
+            if level <= 100 {
+                return Some(level);
+            }
+        }
+    }
+    None
+}
+
+fn read_battery_property(
+    properties: &windows::Foundation::Collections::IMapView<HSTRING, windows::core::IInspectable>,
+    key: &str,
+) -> Option<u8> {
+    let key = HSTRING::from(key);
+    if !properties.HasKey(&key).ok()? {
+        return None;
+    }
+    let value = properties.Lookup(&key).ok()?;
+    let prop: IPropertyValue = value.cast().ok()?;
+    if let Ok(v) = prop.GetUInt8() {
+        if v <= 100 {
+            return Some(v);
+        }
+    }
+    if let Ok(v) = prop.GetInt32() {
+        if (0..=100).contains(&v) {
+            return Some(v as u8);
+        }
+    }
+    if let Ok(v) = prop.GetUInt32() {
+        if v <= 100 {
+            return Some(v as u8);
+        }
+    }
+    None
 }
 
 fn wide_string(value: &[u16]) -> String {

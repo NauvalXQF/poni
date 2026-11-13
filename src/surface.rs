@@ -81,12 +81,13 @@ impl LayeredSurface {
         }
 
         unsafe {
-            let data = pixmap.data();
-            let target = std::slice::from_raw_parts_mut(
+            let (src_pixels, _) = pixmap.data().as_chunks::<4>();
+            let (dst_pixels, _) = std::slice::from_raw_parts_mut(
                 self.bits,
                 (self.width as usize) * (self.height as usize) * 4,
-            );
-            for (dst, src) in target.chunks_exact_mut(4).zip(data.chunks_exact(4)) {
+            )
+            .as_chunks_mut::<4>();
+            for (dst, src) in dst_pixels.iter_mut().zip(src_pixels) {
                 dst[0] = src[2];
                 dst[1] = src[1];
                 dst[2] = src[0];
