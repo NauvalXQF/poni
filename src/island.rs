@@ -270,17 +270,17 @@ fn draw_expanded(pixmap: &mut Pixmap, view: &IslandView<'_>, alpha: f32) {
     let wifi_color = if view.wifi.is_some() { TEXT } else { MUTED };
     draw_wifi_icon(
         pixmap,
-        left + 6.5 * s,
-        baseline - 4.5 * s,
-        13.0 * s,
+        left + 8.0 * s,
+        baseline - 4.0 * s,
+        17.0 * s,
         scale_alpha(wifi_color, alpha),
     );
-    let wifi_label = elide(regular, wifi, 10.5 * s, column_width - 18.0 * s);
+    let wifi_label = elide(regular, wifi, 10.5 * s, column_width - 22.0 * s);
     draw_text(
         pixmap,
         regular,
         &wifi_label,
-        left + 17.0 * s,
+        left + 20.0 * s,
         baseline,
         10.5 * s,
         scale_alpha(wifi_color, alpha),
@@ -292,14 +292,14 @@ fn draw_expanded(pixmap: &mut Pixmap, view: &IslandView<'_>, alpha: f32) {
     } else {
         MUTED
     };
-    let bluetooth_label = elide(regular, bluetooth, 10.5 * s, column_width - 20.0 * s);
+    let bluetooth_label = elide(regular, bluetooth, 10.5 * s, column_width - 22.0 * s);
     let bluetooth_width = measure_text(regular, &bluetooth_label, 10.5 * s);
-    let icon_cx = right - 6.5 * s;
+    let icon_cx = right - 6.0 * s;
     draw_text(
         pixmap,
         regular,
         &bluetooth_label,
-        icon_cx - 11.0 * s - bluetooth_width,
+        icon_cx - 8.0 * s - bluetooth_width,
         baseline,
         10.5 * s,
         scale_alpha(bluetooth_color, alpha),
@@ -307,8 +307,8 @@ fn draw_expanded(pixmap: &mut Pixmap, view: &IslandView<'_>, alpha: f32) {
     draw_bluetooth_icon(
         pixmap,
         icon_cx,
-        baseline - 4.5 * s,
-        13.0 * s,
+        baseline - 4.0 * s,
+        17.0 * s,
         scale_alpha(bluetooth_color, alpha),
     );
 }
@@ -856,6 +856,38 @@ fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::geometry::{geometry_with_notice, ShapeStyle, WINDOW_HEIGHT, WINDOW_WIDTH};
+
+    /// Loads a Windows UI font, or returns `None` when the machine has none.
+    fn test_font(names: &[&str]) -> Option<Font> {
+        let dir = std::env::var_os("WINDIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"))
+            .join("Fonts");
+        for name in names {
+            if let Ok(bytes) = std::fs::read(dir.join(name)) {
+                if let Ok(font) = Font::from_bytes(bytes, fontdue::FontSettings::default()) {
+                    return Some(font);
+                }
+            }
+        }
+        None
+    }
+
+    /// Bright columns in a horizontal band of a rendered island.
+    fn lit_columns(pixmap: &Pixmap, y0: usize, y1: usize) -> Vec<bool> {
+        let width = pixmap.width() as usize;
+        let mut lit = vec![false; width];
+        for y in y0..y1.min(pixmap.height() as usize) {
+            for x in 0..width {
+                let px = &pixmap.data()[(y * width + x) * 4..(y * width + x) * 4 + 4];
+                if px[3] > 40 && (px[0] > 90 || px[1] > 90 || px[2] > 90) {
+                    lit[x] = true;
+                }
+            }
+        }
+        lit
+    }
 
     #[test]
     fn content_layers_never_overlap() {
@@ -913,5 +945,94 @@ mod tests {
         // Surface is pure black for OLED; geometry/content invariants still hold.
         assert_eq!(super::SURFACE.alpha(), 255);
         assert_eq!(super::SURFACE.red(), 0);
+    }
+
+    /// The expanded status row keeps the Wi-Fi and Bluetooth columns apart with
+    /// long names, leaves the shape's side margins alone, and draws the Wi-Fi
+    /// icon large enough to read next to its label.
+    #[test]
+    fn status_row_columns_stay_separate_and_icons_stay_legible() {
+        let Some(regular) = test_font(&["segoeui.ttf", "arial.ttf"]) else {
+            return;
+        };
+        let semibold = test_font(&["seguisb.ttf", "segoeuib.ttf", "arialbd.ttf"]);
+
+        for scale in [1.0_f32, 1.3] {
+            let width = (WINDOW_WIDTH * scale).round() as usize;
+            let height = (WINDOW_HEIGHT * scale).round() as usize;
+            let geometry =
+                geometry_with_notice(1.0, 0.0, ShapeStyle::Attached, scale, width as f32);
+            let view = IslandView {
+                progress: 1.0,
+                geometry,
+                scale,
+                time: "09:41".to_string(),
+                date: "Kam, 12 Nov".to_string(),
+                battery_percent: Some(87),
+                battery_charging: false,
+                wifi: Some("Kost Putri Anggrek 5G Ultra"),
+                bluetooth: Some("Sony WH-1000XM5 Wireless"),
+                notice_mix: 0.0,
+                notice_kind: None,
+                notice_title: None,
+                notice_subtitle: None,
+                notice_battery: None,
+                notice_closing: false,
+                regular: Some(&regular),
+                semibold: semibold.as_ref(),
+            };
+            let Some(pixmap) = draw(width as u32, height as u32, &view) else {
+                panic!("render failed at scale {scale}");
+            };
+
+            let y0 = (geometry.y + 96.0 * scale) as usize;
+            let y1 = (geometry.y + 126.0 * scale) as usize;
+            let lit = lit_columns(&pixmap, y0, y1);
+            let first = lit.iter().position(|on| *on).unwrap_or_else(|| {
+                panic!("status row is empty at scale {scale}");
+            });
+            let last = lit.iter().rposition(|on| *on).expect("status row is empty");
+
+            let left_margin = first as f32 - geometry.x;
+            let right_margin = geometry.x + geometry.width - last as f32 - 1.0;
+            assert!(
+                left_margin >= 26.0 * scale,
+                "Wi-Fi column broke the left margin at scale {scale}: {left_margin}"
+            );
+            assert!(
+                right_margin >= 26.0 * scale,
+                "Bluetooth column broke the right margin at scale {scale}: {right_margin}"
+            );
+
+            // A gap of empty columns proves the two columns never touch.
+            let mut widest_gap = 0usize;
+            let mut gap = 0usize;
+            for on in &lit[first..=last] {
+                if *on {
+                    widest_gap = widest_gap.max(gap);
+                    gap = 0;
+                } else {
+                    gap += 1;
+                }
+            }
+            assert!(
+                widest_gap >= (20.0 * scale) as usize,
+                "status columns collided at scale {scale}: gap {widest_gap}"
+            );
+
+            // The first group is the Wi-Fi icon; it has to stay readable. The
+            // window is wide enough for the glyph but stops before its label.
+            let window = (14.0 * scale).ceil() as usize;
+            let icon_last = lit[first..(first + window).min(lit.len())]
+                .iter()
+                .rposition(|on| *on)
+                .map(|offset| first + offset)
+                .unwrap_or(first);
+            let icon_width = icon_last - first + 1;
+            assert!(
+                icon_width >= (13.0 * scale).ceil() as usize,
+                "Wi-Fi icon shrank to {icon_width}px at scale {scale}"
+            );
+        }
     }
 }
