@@ -5,6 +5,7 @@ mod island;
 mod media;
 mod network;
 mod surface;
+mod timer;
 
 use std::ffi::c_void;
 use std::path::PathBuf;
@@ -14,11 +15,15 @@ use std::time::{Duration, Instant};
 use chrono::Local;
 use fontdue::{Font, FontSettings};
 use geometry::{geometry_with_notice, ShapeStyle, WINDOW_HEIGHT, WINDOW_WIDTH};
-use island::{draw as draw_island, media_controls, IslandView, MediaView, NoticeKind};
+use island::{
+    draw as draw_island, media_controls, timer_controls, timer_presets, IslandView, MediaView,
+    NoticeKind, TimerView,
+};
 use media::{spawn_worker as spawn_media_worker, MediaCommand, MediaState};
 use network::{spawn_worker as spawn_network_worker, NetworkState};
 use serde::{Deserialize, Serialize};
 use surface::LayeredSurface;
+use timer::{Timer, TimerKind};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, GetLastError, BOOL, ERROR_ALREADY_EXISTS, HANDLE, HINSTANCE, HWND, LPARAM,
@@ -36,8 +41,8 @@ use windows::Win32::System::Registry::{
     HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_SZ,
 };
 use windows::Win32::System::Threading::{
-    CreateMutexW, CreateWaitableTimerExW, SetWaitableTimer, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
-    INFINITE, TIMER_ALL_ACCESS,
+    CreateMutexW, CreateWaitableTimerExW, GetCurrentProcessId, SetWaitableTimer,
+    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, INFINITE, TIMER_ALL_ACCESS,
 };
 use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -47,32 +52,35 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Shell::{
     SHQueryUserNotificationState, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD,
-    NIM_DELETE, NOTIFYICONDATAW, QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN,
+    NIM_DELETE, NOTIFYICONDATAW, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     DispatchMessageW, GetClassNameW, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW,
-    GetWindowRect, IsWindowVisible, IsZoomed, LoadCursorW, LoadIconW, MsgWaitForMultipleObjectsEx,
-    PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, TrackPopupMenu, TranslateMessage, CREATESTRUCTW,
-    CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW,
-    IDI_APPLICATION, MA_NOACTIVATE, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG,
-    MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE,
-    SW_SHOWNOACTIVATE, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CREATE, WM_DESTROY,
-    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_HOTKEY, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE,
-    WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_NULL, WM_QUIT, WM_RBUTTONUP, WNDCLASSW,
-    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    GetWindowRect, GetWindowThreadProcessId, IsWindowVisible, IsZoomed, LoadCursorW, LoadIconW,
+    MsgWaitForMultipleObjectsEx, PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW,
+    SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, TrackPopupMenu,
+    TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HTCLIENT,
+    HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW, IDI_APPLICATION, MA_NOACTIVATE, MF_CHECKED, MF_GRAYED,
+    MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT,
+    SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNOACTIVATE, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    WM_APP, WM_CREATE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_HOTKEY, WM_LBUTTONUP,
+    WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_NULL, WM_QUIT,
+    WM_RBUTTONUP, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP,
 };
 
 const WINDOW_CLASS: PCWSTR = w!("PoniIslandWindow");
 const WINDOW_TITLE: PCWSTR = w!("Poni");
 const HOTKEY_PIN: i32 = 1;
 const HOTKEY_QUIT: i32 = 2;
+const HOTKEY_TIMER: i32 = 3;
 /// One shared rate for shape and notice motion so every layer settles
 /// together instead of racing each other.
 const MOTION_RATE: f32 = 16.0;
 const HOVER_INTENT: Duration = Duration::from_millis(140);
 const NOTICE_DURATION: Duration = Duration::from_secs(3);
+const TIMER_NOTICE_DURATION: Duration = Duration::from_secs(6);
 const NOTICE_QUICK_EXIT: Duration = Duration::from_millis(350);
 const TRAY_MESSAGE: u32 = WM_APP + 1;
 const TRAY_ID: u32 = 1;
@@ -85,6 +93,13 @@ const CMD_SCALE_125: usize = 112;
 const CMD_SCALE_130: usize = 113;
 const CMD_AUTOSTART: usize = 120;
 const CMD_QUIT: usize = 130;
+const CMD_TIMER_1: usize = 140;
+const CMD_TIMER_5: usize = 141;
+const CMD_TIMER_10: usize = 142;
+const CMD_TIMER_25: usize = 143;
+const CMD_TIMER_STOPWATCH: usize = 144;
+const CMD_TIMER_TOGGLE: usize = 145;
+const CMD_TIMER_STOP: usize = 146;
 const SCALE_OPTIONS: [f32; 4] = [0.75, 1.0, 1.25, 1.3];
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 const RUN_VALUE: PCWSTR = w!("Poni");
@@ -127,28 +142,36 @@ struct Notice {
     title: String,
     subtitle: String,
     battery: Option<u8>,
+    duration: Duration,
     until: Instant,
 }
 
 unsafe fn foreground_is_fullscreen(our_hwnd: HWND) -> bool {
+    let foreground = GetForegroundWindow();
+    if foreground.0.is_null() || foreground == our_hwnd {
+        return false;
+    }
+
+    // Opening the tray menu briefly makes Poni the foreground window, and
+    // Windows reports QUNS_BUSY for our topmost layered surface. Never hide the
+    // island because of a window that belongs to this process.
+    let mut foreground_pid = 0u32;
+    GetWindowThreadProcessId(foreground, Some(&mut foreground_pid));
+    if foreground_pid != 0 && foreground_pid == GetCurrentProcessId() {
+        return false;
+    }
+
     if let Ok(state) = SHQueryUserNotificationState() {
-        if [
-            QUNS_BUSY.0,
-            QUNS_PRESENTATION_MODE.0,
-            QUNS_RUNNING_D3D_FULL_SCREEN.0,
-        ]
-        .contains(&state.0)
-        {
+        // QUNS_BUSY is deliberately ignored: Windows reports it for ordinary
+        // topmost panels (including our own island and the tray menu), which
+        // caused false fullscreen hides. Presentation mode and D3D fullscreen
+        // are explicit, and the geometry check below catches borderless games.
+        if [QUNS_PRESENTATION_MODE.0, QUNS_RUNNING_D3D_FULL_SCREEN.0].contains(&state.0) {
             return true;
         }
     }
 
-    let foreground = GetForegroundWindow();
-    if foreground.0.is_null()
-        || foreground == our_hwnd
-        || !IsWindowVisible(foreground).as_bool()
-        || IsZoomed(foreground).as_bool()
-    {
+    if !IsWindowVisible(foreground).as_bool() || IsZoomed(foreground).as_bool() {
         return false;
     }
 
@@ -230,6 +253,8 @@ struct App {
     /// bar between the worker's polls.
     media_received_at: Instant,
     anim_start: Instant,
+    /// Live countdown or stopwatch; `None` when the idle clock card is shown.
+    timer_state: Option<Timer>,
     notice: Option<Notice>,
     notice_closing: bool,
     pending_notice: Option<Notice>,
@@ -278,6 +303,7 @@ impl App {
             media: MediaState::default(),
             media_received_at: Instant::now(),
             anim_start: Instant::now(),
+            timer_state: None,
             notice: None,
             notice_closing: false,
             pending_notice: None,
@@ -311,6 +337,12 @@ impl App {
             HOTKEY_QUIT,
             MOD_CONTROL | MOD_ALT | MOD_NOREPEAT,
             'Q' as u32,
+        );
+        let _ = RegisterHotKey(
+            hwnd,
+            HOTKEY_TIMER,
+            MOD_CONTROL | MOD_ALT | MOD_NOREPEAT,
+            'T' as u32,
         );
 
         self.add_tray_icon();
@@ -421,6 +453,21 @@ impl App {
             return;
         }
 
+        let state = unsafe { SHQueryUserNotificationState() }
+            .map(|state| state.0)
+            .unwrap_or(-1);
+        let mut foreground_rect = RECT::default();
+        let foreground = unsafe { GetForegroundWindow() };
+        let _ = unsafe { GetWindowRect(foreground, &mut foreground_rect) };
+        log_line(&format!(
+            "display: {} (quns {state}, fg {}x{} at {},{})",
+            if fullscreen { "hid" } else { "restored" },
+            foreground_rect.right - foreground_rect.left,
+            foreground_rect.bottom - foreground_rect.top,
+            foreground_rect.left,
+            foreground_rect.top
+        ));
+
         self.hidden_for_fullscreen = fullscreen;
         unsafe {
             if fullscreen {
@@ -467,6 +514,17 @@ impl App {
         subtitle: String,
         battery: Option<u8>,
     ) {
+        self.show_notice_for(kind, title, subtitle, battery, NOTICE_DURATION);
+    }
+
+    fn show_notice_for(
+        &mut self,
+        kind: NoticeKind,
+        title: &str,
+        subtitle: String,
+        battery: Option<u8>,
+        duration: Duration,
+    ) {
         if self.hidden_for_fullscreen {
             return;
         }
@@ -476,7 +534,8 @@ impl App {
             title: title.to_string(),
             subtitle,
             battery,
-            until: now + NOTICE_DURATION,
+            duration,
+            until: now + duration,
         };
 
         if self.notice.is_some() {
@@ -533,11 +592,96 @@ impl App {
         position
     }
 
+    /// Media only takes over the card when it has a title to show. With
+    /// nothing playing, the clock card (and its timer presets) comes back.
+    fn has_media(&self) -> bool {
+        self.media.active && !self.media.title.trim().is_empty()
+    }
+
+    fn timer_view(&self) -> Option<TimerView> {
+        let timer = self.timer_state.as_ref()?;
+        let now = Instant::now();
+        Some(TimerView {
+            display: timer.display(now),
+            label: timer.kind().label(),
+            progress: timer.progress(now),
+            countdown: timer.kind() == TimerKind::Countdown,
+            running: timer.is_running(),
+        })
+    }
+
+    fn start_countdown(&mut self, duration: Duration) {
+        self.timer_state = Some(Timer::countdown(duration));
+        self.redraw();
+    }
+
+    fn start_stopwatch(&mut self) {
+        self.timer_state = Some(Timer::stopwatch());
+        self.redraw();
+    }
+
+    fn toggle_timer(&mut self) {
+        if let Some(timer) = self.timer_state.as_mut() {
+            timer.toggle(Instant::now());
+            self.redraw();
+        }
+    }
+
+    fn stop_timer(&mut self) {
+        if self.timer_state.take().is_some() {
+            self.redraw();
+        }
+    }
+
+    /// `Ctrl+Alt+T` starts a five-minute countdown, or pauses/resumes the
+    /// timer that is already live.
+    fn timer_hotkey(&mut self) {
+        if self.timer_state.is_some() {
+            self.toggle_timer();
+        } else {
+            self.start_countdown(Duration::from_secs(300));
+        }
+    }
+
     /// Transport buttons own their circle in the expanded media card; every
     /// other click keeps the old pin behaviour.
     unsafe fn handle_click(&mut self, px: f32, py: f32) {
+        let scale = self.effective_scale();
+        if self.progress > 0.5 {
+            if self.timer_state.is_some() {
+                let controls = timer_controls(&self.geometry(), scale);
+                let hit = |(cx, cy): (f32, f32)| {
+                    let dx = px - cx;
+                    let dy = py - cy;
+                    dx * dx + dy * dy <= controls.radius * controls.radius
+                };
+                if hit(controls.pause) {
+                    self.toggle_timer();
+                    return;
+                }
+                if hit(controls.stop) {
+                    self.stop_timer();
+                    return;
+                }
+            } else if !self.has_media() {
+                for preset in timer_presets(&self.geometry(), scale) {
+                    let inside = px >= preset.x
+                        && px <= preset.x + preset.width
+                        && py >= preset.y
+                        && py <= preset.y + preset.height;
+                    if inside {
+                        match preset.seconds {
+                            Some(seconds) => self.start_countdown(Duration::from_secs(seconds)),
+                            None => self.start_stopwatch(),
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+
         if self.media.active && self.progress > 0.5 {
-            let controls = media_controls(&self.geometry(), self.effective_scale());
+            let controls = media_controls(&self.geometry(), scale);
             let hit = |(cx, cy): (f32, f32)| {
                 let dx = px - cx;
                 let dy = py - cy;
@@ -647,6 +791,21 @@ impl App {
         let date = Local::now().format("%a, %d %b").to_string();
 
         let mut changed = self.update_system_status(false);
+        if self
+            .timer_state
+            .as_ref()
+            .is_some_and(|timer| timer.finished(now))
+        {
+            self.timer_state = None;
+            self.show_notice_for(
+                NoticeKind::Timer,
+                "Timer",
+                "Time's up!".to_string(),
+                None,
+                TIMER_NOTICE_DURATION,
+            );
+            changed = true;
+        }
         if self.update_media_state(now) {
             changed = true;
         }
@@ -681,8 +840,18 @@ impl App {
         }
 
         // The pill waveform and the card progress bar move with the clock, so
-        // they need a frame even when no new media snapshot arrived.
-        if self.media.active && self.media.playing {
+        // they need a frame even when no new media snapshot arrived. While the
+        // timer owns the card, media motion stays invisible and is skipped.
+        if self.media.active && self.media.playing && self.timer_state.is_none() {
+            changed = true;
+        }
+        // A running timer changes its value every second; the frame also keeps
+        // the completion notice timely. The cadence lives in next_interval_ms.
+        if self
+            .timer_state
+            .as_ref()
+            .is_some_and(|timer| timer.is_running())
+        {
             changed = true;
         }
 
@@ -692,7 +861,7 @@ impl App {
             self.notice_closing = false;
             changed = true;
             if let Some(mut next) = self.pending_notice.take() {
-                next.until = Instant::now() + NOTICE_DURATION;
+                next.until = Instant::now() + next.duration;
                 self.notice = Some(next);
                 self.request_frame();
             }
@@ -731,7 +900,20 @@ impl App {
 
         if animating {
             1000.0 / self.refresh_hz.max(30.0)
-        } else if self.media.active && self.media.playing {
+        } else if self
+            .timer_state
+            .as_ref()
+            .is_some_and(|timer| timer.is_running())
+        {
+            if self.progress > 0.5 {
+                // Expanded timer: the depleting bar moves smoothly at 10fps.
+                100.0
+            } else {
+                // Collapsed pill: the text only changes once a second, so
+                // 5fps is enough to catch the tick without wasting frames.
+                200.0
+            }
+        } else if self.media.active && self.media.playing && self.timer_state.is_none() {
             if self.progress > 0.5 {
                 // Expanded card: the only motion is a 3px progress bar, so a
                 // slow cadence is visually identical and keeps the laptop cool.
@@ -771,6 +953,7 @@ impl App {
                 duration_ms: self.media.duration_ms,
                 art: self.media.art.as_deref(),
             });
+        let timer_view = self.timer_view();
         let view = IslandView {
             progress: self.progress,
             geometry: self.geometry(),
@@ -788,6 +971,7 @@ impl App {
             notice_battery: self.notice.as_ref().and_then(|notice| notice.battery),
             notice_closing: self.notice_closing,
             media: media_view,
+            timer: timer_view,
             anim: self.anim_start.elapsed().as_secs_f32(),
             regular: self.fonts.regular.as_ref(),
             semibold: self.fonts.semibold.as_ref(),
@@ -938,6 +1122,42 @@ impl App {
             let _ = AppendMenuW(menu, MF_POPUP, size_menu.0 as usize, w!("Size"));
         }
 
+        if let Ok(timer_menu) = CreatePopupMenu() {
+            for (id, label) in [
+                (CMD_TIMER_1, w!("1 minute")),
+                (CMD_TIMER_5, w!("5 minutes")),
+                (CMD_TIMER_10, w!("10 minutes")),
+                (CMD_TIMER_25, w!("25 minutes")),
+                (CMD_TIMER_STOPWATCH, w!("Stopwatch")),
+            ] {
+                let _ = AppendMenuW(timer_menu, MF_STRING, id, label);
+            }
+            let _ = AppendMenuW(timer_menu, MF_SEPARATOR, 0, w!(""));
+            if let Some(timer) = self.timer_state.as_ref() {
+                let label = if timer.is_running() {
+                    w!("Pause")
+                } else {
+                    w!("Resume")
+                };
+                let _ = AppendMenuW(timer_menu, MF_STRING, CMD_TIMER_TOGGLE, label);
+                let _ = AppendMenuW(timer_menu, MF_STRING, CMD_TIMER_STOP, w!("Stop"));
+            } else {
+                let _ = AppendMenuW(
+                    timer_menu,
+                    MF_STRING | MF_GRAYED,
+                    CMD_TIMER_TOGGLE,
+                    w!("Pause"),
+                );
+                let _ = AppendMenuW(
+                    timer_menu,
+                    MF_STRING | MF_GRAYED,
+                    CMD_TIMER_STOP,
+                    w!("Stop"),
+                );
+            }
+            let _ = AppendMenuW(menu, MF_POPUP, timer_menu.0 as usize, w!("Timer"));
+        }
+
         let autostart_flags = if autostart_enabled() {
             MF_STRING | MF_CHECKED
         } else {
@@ -977,6 +1197,13 @@ impl App {
             CMD_SCALE_125 => self.set_shape_scale(1.25),
             CMD_SCALE_130 => self.set_shape_scale(1.3),
             CMD_AUTOSTART => set_autostart(!autostart_enabled()),
+            CMD_TIMER_1 => self.start_countdown(Duration::from_secs(60)),
+            CMD_TIMER_5 => self.start_countdown(Duration::from_secs(300)),
+            CMD_TIMER_10 => self.start_countdown(Duration::from_secs(600)),
+            CMD_TIMER_25 => self.start_countdown(Duration::from_secs(1500)),
+            CMD_TIMER_STOPWATCH => self.start_stopwatch(),
+            CMD_TIMER_TOGGLE => self.toggle_timer(),
+            CMD_TIMER_STOP => self.stop_timer(),
             CMD_QUIT => {
                 let _ = DestroyWindow(self.hwnd);
             }
@@ -1236,6 +1463,11 @@ unsafe extern "system" fn wnd_proc(
                 HOTKEY_QUIT => {
                     let _ = DestroyWindow(hwnd);
                 }
+                HOTKEY_TIMER => {
+                    if let Some(app) = app_mut(hwnd) {
+                        app.timer_hotkey();
+                    }
+                }
                 _ => {}
             }
             LRESULT(0)
@@ -1263,6 +1495,7 @@ unsafe extern "system" fn wnd_proc(
                 }
                 let _ = UnregisterHotKey(hwnd, HOTKEY_PIN);
                 let _ = UnregisterHotKey(hwnd, HOTKEY_QUIT);
+                let _ = UnregisterHotKey(hwnd, HOTKEY_TIMER);
             }
             PostQuitMessage(0);
             LRESULT(0)

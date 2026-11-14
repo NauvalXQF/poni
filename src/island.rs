@@ -12,12 +12,83 @@ const TEXT: ColorU8 = ColorU8::from_rgba(245, 244, 240, 250);
 const MUTED: ColorU8 = ColorU8::from_rgba(158, 157, 152, 205);
 const GREEN: ColorU8 = ColorU8::from_rgba(102, 224, 151, 255);
 const RED: ColorU8 = ColorU8::from_rgba(255, 99, 99, 255);
+/// ReyLand's timer accent: warm amber, distinct from the blue-ish white clock
+/// and the system accents used by the battery ring.
+const AMBER: ColorU8 = ColorU8::from_rgba(242, 163, 59, 255);
+/// Unified chip fill for the preset buttons on the idle card.
+const CHIP: ColorU8 = ColorU8::from_rgba(255, 255, 255, 20);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum NoticeKind {
     Wifi,
     Bluetooth,
     Airplane,
+    Timer,
+}
+
+/// One live countdown or stopwatch snapshot, already formatted by the caller.
+pub struct TimerView {
+    pub display: String,
+    pub label: &'static str,
+    pub progress: f32,
+    pub countdown: bool,
+    pub running: bool,
+}
+
+/// One preset chip on the idle card. `seconds` is `None` for the stopwatch.
+#[derive(Clone, Copy, Debug)]
+pub struct TimerPreset {
+    pub label: &'static str,
+    pub seconds: Option<u64>,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+/// Preset chips share their geometry with the click handler so a click always
+/// lands on the chip that was drawn.
+pub fn timer_presets(geo: &Geometry, scale: f32) -> [TimerPreset; 5] {
+    const DEFS: [(&str, Option<u64>); 5] = [
+        ("1m", Some(60)),
+        ("5m", Some(300)),
+        ("10m", Some(600)),
+        ("25m", Some(1500)),
+        ("Stopwatch", None),
+    ];
+    let s = scale;
+    let left = geo.x + 28.0 * s;
+    let right = geo.x + geo.width - 28.0 * s;
+    let gap = 7.0 * s;
+    let width = ((right - left) - gap * 4.0).max(0.0) / 5.0;
+    let y = geo.y + 66.0 * s;
+    let height = 30.0 * s;
+    std::array::from_fn(|index| TimerPreset {
+        label: DEFS[index].0,
+        seconds: DEFS[index].1,
+        x: left + index as f32 * (width + gap),
+        y,
+        width,
+        height,
+    })
+}
+
+/// Circle centres for the expanded timer controls.
+#[derive(Clone, Copy, Debug)]
+pub struct TimerControls {
+    pub pause: (f32, f32),
+    pub stop: (f32, f32),
+    pub radius: f32,
+}
+
+pub fn timer_controls(geo: &Geometry, scale: f32) -> TimerControls {
+    let cx = geo.x + geo.width / 2.0;
+    let cy = geo.y + 84.0 * scale;
+    TimerControls {
+        pause: (cx - 28.0 * scale, cy),
+        stop: (cx + 28.0 * scale, cy),
+        radius: 16.0 * scale,
+    }
 }
 
 pub struct MediaView<'a> {
@@ -78,6 +149,8 @@ pub struct IslandView<'a> {
     pub notice_battery: Option<u8>,
     pub notice_closing: bool,
     pub media: Option<MediaView<'a>>,
+    /// A running or paused timer takes over both the pill and the card.
+    pub timer: Option<TimerView>,
     /// Monotonic seconds used to animate the live waveform.
     pub anim: f32,
     pub regular: Option<&'a Font>,
@@ -179,6 +252,13 @@ fn draw_collapsed(pixmap: &mut Pixmap, view: &IslandView<'_>, alpha: f32) {
     let right = geo.x + geo.width - 18.0 * s;
     let baseline = geo.y + geo.height / 2.0 + 5.5 * s;
 
+    // The timer replaces the clock instead of joining it, so the pill stays
+    // glanceable while a countdown is live.
+    if let Some(timer) = view.timer.as_ref() {
+        draw_collapsed_timer(pixmap, view, timer, left, right, baseline, alpha);
+        return;
+    }
+
     draw_text(
         pixmap,
         semibold,
@@ -239,6 +319,59 @@ fn draw_collapsed(pixmap: &mut Pixmap, view: &IslandView<'_>, alpha: f32) {
     );
 }
 
+/// Compact pill while a timer runs: amber stopwatch, the live value, and a
+/// muted mode label on the right. The dimmed value means the timer is paused.
+fn draw_collapsed_timer(
+    pixmap: &mut Pixmap,
+    view: &IslandView<'_>,
+    timer: &TimerView,
+    left: f32,
+    right: f32,
+    baseline: f32,
+    alpha: f32,
+) {
+    let Some(regular) = view.regular.or(view.semibold) else {
+        return;
+    };
+    let semibold = view.semibold.unwrap_or(regular);
+    let s = view.scale;
+    let center_y = view.geometry.y + view.geometry.height / 2.0;
+
+    let icon_size = 14.0 * s;
+    let icon_cx = left + icon_size * 0.42;
+    draw_stopwatch_icon(
+        pixmap,
+        icon_cx,
+        center_y,
+        icon_size,
+        scale_alpha(AMBER, alpha),
+    );
+
+    let text_left = icon_cx + icon_size * 0.72;
+    let color = if timer.running { TEXT } else { MUTED };
+    draw_text(
+        pixmap,
+        semibold,
+        &timer.display,
+        text_left,
+        baseline,
+        15.5 * s,
+        scale_alpha(color, alpha),
+    );
+
+    let label_size = 10.5 * s;
+    let label_width = measure_text(regular, timer.label, label_size);
+    draw_text(
+        pixmap,
+        regular,
+        timer.label,
+        right - label_width,
+        center_y + 3.7 * s,
+        label_size,
+        scale_alpha(MUTED, alpha * 0.9),
+    );
+}
+
 fn draw_expanded(pixmap: &mut Pixmap, view: &IslandView<'_>, alpha: f32) {
     let Some(regular) = view.regular.or(view.semibold) else {
         return;
@@ -251,6 +384,12 @@ fn draw_expanded(pixmap: &mut Pixmap, view: &IslandView<'_>, alpha: f32) {
     let right = geo.x + geo.width - 28.0 * s;
     let top = geo.y;
 
+    if let Some(timer) = view.timer.as_ref() {
+        draw_expanded_timer(pixmap, view, timer, regular, semibold, alpha);
+        draw_expanded_status(pixmap, view, regular, alpha);
+        return;
+    }
+
     if let Some(media) = view.media.as_ref() {
         draw_expanded_media(pixmap, view, media, regular, semibold, alpha);
         draw_expanded_status(pixmap, view, regular, alpha);
@@ -262,7 +401,7 @@ fn draw_expanded(pixmap: &mut Pixmap, view: &IslandView<'_>, alpha: f32) {
         semibold,
         &view.time,
         left,
-        top + 46.0 * s,
+        top + 38.0 * s,
         31.0 * s,
         scale_alpha(TEXT, alpha),
     );
@@ -271,7 +410,7 @@ fn draw_expanded(pixmap: &mut Pixmap, view: &IslandView<'_>, alpha: f32) {
         regular,
         &view.date,
         left,
-        top + 66.0 * s,
+        top + 56.0 * s,
         11.5 * s,
         scale_alpha(MUTED, alpha),
     );
@@ -318,6 +457,7 @@ fn draw_expanded(pixmap: &mut Pixmap, view: &IslandView<'_>, alpha: f32) {
         );
     }
 
+    draw_timer_presets(pixmap, view, semibold, alpha);
     draw_expanded_status(pixmap, view, regular, alpha);
 }
 
@@ -586,6 +726,168 @@ fn draw_expanded_media(
     );
 }
 
+/// Expanded timer card: amber stopwatch, large live value, a depleting bar
+/// for countdowns, and pause/stop circles on the shared control row.
+fn draw_expanded_timer(
+    pixmap: &mut Pixmap,
+    view: &IslandView<'_>,
+    timer: &TimerView,
+    regular: &Font,
+    semibold: &Font,
+    alpha: f32,
+) {
+    let s = view.scale;
+    let geo = view.geometry;
+    let left = geo.x + 28.0 * s;
+    let right = geo.x + geo.width - 28.0 * s;
+    let top = geo.y;
+
+    let icon_size = 19.0 * s;
+    let icon_cx = left + icon_size * 0.46;
+    let icon_cy = top + 30.0 * s;
+    draw_stopwatch_icon(
+        pixmap,
+        icon_cx,
+        icon_cy,
+        icon_size,
+        scale_alpha(AMBER, alpha),
+    );
+
+    let time_left = icon_cx + icon_size * 0.78;
+    draw_text(
+        pixmap,
+        semibold,
+        &timer.display,
+        time_left,
+        top + 42.0 * s,
+        30.0 * s,
+        scale_alpha(if timer.running { TEXT } else { MUTED }, alpha),
+    );
+
+    let label_size = 10.5 * s;
+    let label_width = measure_text(regular, timer.label, label_size);
+    draw_text(
+        pixmap,
+        regular,
+        timer.label,
+        right - label_width,
+        top + 22.0 * s,
+        label_size,
+        scale_alpha(MUTED, alpha * 0.9),
+    );
+    if !timer.running {
+        let paused = "Paused";
+        let paused_width = measure_text(regular, paused, label_size);
+        draw_text(
+            pixmap,
+            regular,
+            paused,
+            right - paused_width,
+            top + 38.0 * s,
+            label_size,
+            scale_alpha(AMBER, alpha),
+        );
+    }
+
+    if timer.countdown {
+        let bar_y = top + 62.0 * s;
+        let bar_height = 3.0 * s;
+        let bar_radius = bar_height / 2.0;
+        let full_width = right - left;
+        fill_rounded_rect(
+            pixmap,
+            left,
+            bar_y,
+            full_width,
+            bar_height,
+            bar_radius,
+            ColorU8::from_rgba(255, 255, 255, (46.0 * alpha) as u8),
+        );
+        let progress = timer.progress.clamp(0.0, 1.0);
+        if progress > 0.001 {
+            let fill_alpha = if timer.running { alpha } else { alpha * 0.55 };
+            fill_rounded_rect(
+                pixmap,
+                left,
+                bar_y,
+                full_width * progress,
+                bar_height,
+                bar_radius,
+                scale_alpha(AMBER, fill_alpha),
+            );
+        }
+    }
+
+    let controls = timer_controls(&geo, s);
+    let circle_fill = ColorU8::from_rgba(255, 255, 255, (22.0 * alpha) as u8);
+    draw_filled_circle(
+        pixmap,
+        controls.pause.0,
+        controls.pause.1,
+        controls.radius,
+        circle_fill,
+    );
+    draw_transport_icon(
+        pixmap,
+        if timer.running {
+            PlaybackIcon::Pause
+        } else {
+            PlaybackIcon::Play
+        },
+        controls.pause.0,
+        controls.pause.1,
+        13.0 * s,
+        scale_alpha(TEXT, alpha),
+    );
+    draw_filled_circle(
+        pixmap,
+        controls.stop.0,
+        controls.stop.1,
+        controls.radius,
+        circle_fill,
+    );
+    draw_stop_icon(
+        pixmap,
+        controls.stop.0,
+        controls.stop.1,
+        13.0 * s,
+        scale_alpha(TEXT, alpha),
+    );
+}
+
+/// Five chips across the idle card. They sit above the status row and share
+/// their geometry with the click handler.
+fn draw_timer_presets(pixmap: &mut Pixmap, view: &IslandView<'_>, font: &Font, alpha: f32) {
+    let s = view.scale;
+    for preset in timer_presets(&view.geometry, s) {
+        fill_rounded_rect(
+            pixmap,
+            preset.x,
+            preset.y,
+            preset.width,
+            preset.height,
+            preset.height / 2.0,
+            scale_alpha(CHIP, alpha),
+        );
+        let mut size = 10.0 * s;
+        let mut label_width = measure_text(font, preset.label, size);
+        let max_width = (preset.width - 10.0 * s).max(0.0);
+        if label_width > max_width && label_width > 0.0 {
+            size *= max_width / label_width;
+            label_width = measure_text(font, preset.label, size);
+        }
+        draw_text(
+            pixmap,
+            font,
+            preset.label,
+            preset.x + (preset.width - label_width) / 2.0,
+            preset.y + preset.height / 2.0 + size * 0.35,
+            size,
+            scale_alpha(TEXT, alpha * 0.88),
+        );
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PlaybackIcon {
     Previous,
@@ -669,6 +971,77 @@ fn draw_transport_icon(
             );
         }
     }
+}
+
+/// A stopwatch with a crown, a side pusher, and a single hand. Used for the
+/// timer accent in the pill, the expanded card, and the completion notice.
+fn draw_stopwatch_icon(pixmap: &mut Pixmap, cx: f32, cy: f32, size: f32, color: ColorU8) {
+    let radius = size * 0.33;
+    let center_y = cy + size * 0.09;
+
+    fill_rounded_rect(
+        pixmap,
+        cx - size * 0.11,
+        center_y - radius - size * 0.20,
+        size * 0.22,
+        size * 0.18,
+        size * 0.05,
+        color,
+    );
+    draw_filled_circle(
+        pixmap,
+        cx + radius * 1.06,
+        center_y - radius * 0.62,
+        size * 0.085,
+        color,
+    );
+
+    let mut ring = PathBuilder::new();
+    ring.push_circle(cx, center_y, radius);
+    let mut paint = Paint::default();
+    paint.set_color(Color::from_rgba8(
+        color.red(),
+        color.green(),
+        color.blue(),
+        color.alpha(),
+    ));
+    if let Some(path) = ring.finish() {
+        let stroke = Stroke {
+            width: (size * 0.085).max(1.2),
+            line_cap: LineCap::Round,
+            line_join: LineJoin::Round,
+            ..Default::default()
+        };
+        pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+    }
+
+    let mut hand = PathBuilder::new();
+    hand.move_to(cx, center_y);
+    hand.line_to(cx + radius * 0.42, center_y - radius * 0.46);
+    if let Some(path) = hand.finish() {
+        let stroke = Stroke {
+            width: (size * 0.075).max(1.1),
+            line_cap: LineCap::Round,
+            line_join: LineJoin::Round,
+            ..Default::default()
+        };
+        pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+    }
+    draw_filled_circle(pixmap, cx, center_y, size * 0.055, color);
+}
+
+/// The stop control: a rounded square, matching the transport icon weight.
+fn draw_stop_icon(pixmap: &mut Pixmap, cx: f32, cy: f32, size: f32, color: ColorU8) {
+    let side = size * 0.56;
+    fill_rounded_rect(
+        pixmap,
+        cx - side / 2.0,
+        cy - side / 2.0,
+        side,
+        side,
+        size * 0.10,
+        color,
+    );
 }
 
 /// Placeholder artwork for tracks that have no cover: a small beamed note.
@@ -959,15 +1332,18 @@ fn draw_notice(pixmap: &mut Pixmap, view: &IslandView<'_>, alpha: f32) {
     let geo = view.geometry;
     let icon_x = geo.x + 24.0 * s;
     let center_y = geo.y + geo.height / 2.0;
-    let icon_color = scale_alpha(TEXT, alpha);
+    let icon_color = if kind == NoticeKind::Timer {
+        scale_alpha(AMBER, alpha)
+    } else {
+        scale_alpha(TEXT, alpha)
+    };
+    let disc = if kind == NoticeKind::Timer {
+        ColorU8::from_rgba(242, 163, 59, (26.0 * alpha) as u8)
+    } else {
+        ColorU8::from_rgba(255, 255, 255, (12.0 * alpha) as u8)
+    };
 
-    draw_filled_circle(
-        pixmap,
-        icon_x,
-        center_y,
-        15.0 * s,
-        ColorU8::from_rgba(255, 255, 255, (12.0 * alpha) as u8),
-    );
+    draw_filled_circle(pixmap, icon_x, center_y, 15.0 * s, disc);
     draw_notice_icon(pixmap, kind, icon_x, center_y, 18.0 * s, icon_color);
 
     draw_text(
@@ -1019,6 +1395,7 @@ fn draw_notice_icon(
         NoticeKind::Wifi => draw_wifi_icon(pixmap, cx, cy, size, color),
         NoticeKind::Bluetooth => draw_bluetooth_icon(pixmap, cx, cy, size, color),
         NoticeKind::Airplane => draw_airplane_icon(pixmap, cx, cy, size, color),
+        NoticeKind::Timer => draw_stopwatch_icon(pixmap, cx, cy, size, color),
     }
 }
 
@@ -1488,7 +1865,9 @@ fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geometry::{geometry_with_notice, ShapeStyle, WINDOW_HEIGHT, WINDOW_WIDTH};
+    use crate::geometry::{
+        geometry_with_notice, Geometry, ShapeStyle, WINDOW_HEIGHT, WINDOW_WIDTH,
+    };
 
     /// Loads a Windows UI font, or returns `None` when the machine has none.
     fn test_font(names: &[&str]) -> Option<Font> {
@@ -1611,6 +1990,7 @@ mod tests {
                 notice_battery: None,
                 notice_closing: false,
                 media: None,
+                timer: None,
                 anim: 0.0,
                 regular: Some(&regular),
                 semibold: semibold.as_ref(),
@@ -1779,6 +2159,7 @@ mod tests {
                     duration_ms: 214_000,
                     art: Some(&art),
                 }),
+                timer: None,
                 anim: 1.2,
                 regular: Some(&regular),
                 semibold: semibold.as_ref(),
@@ -1839,6 +2220,7 @@ mod tests {
                     duration_ms: 214_000,
                     art: Some(&art),
                 }),
+                timer: None,
                 anim: 1.2,
                 regular: Some(&regular),
                 semibold: semibold.as_ref(),
@@ -1890,5 +2272,346 @@ mod tests {
         assert_eq!(format_time(9_400), "0:09");
         assert_eq!(format_time(62_000), "1:02");
         assert_eq!(format_time(3_599_000), "59:59");
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn test_view<'a>(
+        geometry: Geometry,
+        scale: f32,
+        regular: &'a Font,
+        semibold: Option<&'a Font>,
+        progress: f32,
+        media: Option<MediaView<'a>>,
+        timer: Option<TimerView>,
+    ) -> IslandView<'a> {
+        IslandView {
+            progress,
+            geometry,
+            scale,
+            time: "09:41".to_string(),
+            date: "Kam, 12 Nov".to_string(),
+            battery_percent: Some(87),
+            battery_charging: false,
+            wifi: Some("Kost Putri Anggrek 5G"),
+            bluetooth: Some("Sony WH-1000XM5"),
+            notice_mix: 0.0,
+            notice_kind: None,
+            notice_title: None,
+            notice_subtitle: None,
+            notice_battery: None,
+            notice_closing: false,
+            media,
+            timer,
+            anim: 1.2,
+            regular: Some(regular),
+            semibold,
+        }
+    }
+
+    /// Counts pixels that can only come from the amber timer accent.
+    fn amber_pixels_in(pixmap: &Pixmap, x0: f32, y0: f32, x1: f32, y1: f32) -> usize {
+        let width = pixmap.width() as i32;
+        let height = pixmap.height() as i32;
+        let x0 = (x0.floor() as i32).max(0);
+        let y0 = (y0.floor() as i32).max(0);
+        let x1 = (x1.ceil() as i32).min(width);
+        let y1 = (y1.ceil() as i32).min(height);
+        let mut count = 0;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let index = (y as usize * width as usize + x as usize) * 4;
+                let px = &pixmap.data()[index..index + 4];
+                if px[3] > 100 && px[0] > 180 && px[1] > 90 && px[1] < 220 && px[2] < 120 {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    #[test]
+    fn collapsed_timer_replaces_the_clock_with_amber_and_a_live_value() {
+        let Some(regular) = test_font(&["segoeui.ttf", "arial.ttf"]) else {
+            return;
+        };
+        let semibold = test_font(&["seguisb.ttf", "segoeuib.ttf", "arialbd.ttf"]);
+
+        for scale in [1.0_f32, 1.3] {
+            let width = (WINDOW_WIDTH * scale).round() as usize;
+            let height = (WINDOW_HEIGHT * scale).round() as usize;
+            let geometry =
+                geometry_with_notice(0.0, 0.0, ShapeStyle::Attached, scale, width as f32);
+            let view = test_view(
+                geometry,
+                scale,
+                &regular,
+                semibold.as_ref(),
+                0.0,
+                None,
+                Some(TimerView {
+                    display: "4:59".to_string(),
+                    label: "Timer",
+                    progress: 0.83,
+                    countdown: true,
+                    running: true,
+                }),
+            );
+            let pixmap = draw(width as u32, height as u32, &view).expect("render");
+
+            let amber = amber_pixels_in(&pixmap, 0.0, 0.0, width as f32, height as f32);
+            assert!(
+                amber >= (20.0 * scale * scale) as usize,
+                "timer accent is missing at scale {scale}: {amber} pixels"
+            );
+
+            let baseline = geometry.y + geometry.height / 2.0 + 5.5 * scale;
+            let band = (baseline - 12.0 * scale) as usize
+                ..((baseline + 3.0 * scale) as usize).min(pixmap.height() as usize);
+            let lit = lit_columns(&pixmap, band.start, band.end);
+            let left_half = lit[..width / 2].iter().filter(|on| **on).count();
+            let right_half = lit[width / 2..].iter().filter(|on| **on).count();
+            assert!(
+                left_half >= (8.0 * scale) as usize,
+                "timer value is missing at scale {scale}"
+            );
+            assert!(
+                right_half >= (4.0 * scale) as usize,
+                "timer mode label is missing at scale {scale}: left {left_half}, right {right_half}"
+            );
+        }
+    }
+
+    #[test]
+    fn timer_presets_fit_the_idle_card_and_share_click_geometry() {
+        let Some(regular) = test_font(&["segoeui.ttf", "arial.ttf"]) else {
+            return;
+        };
+        let semibold = test_font(&["seguisb.ttf", "segoeuib.ttf", "arialbd.ttf"]);
+
+        for scale in [1.0_f32, 1.3] {
+            let width = (WINDOW_WIDTH * scale).round() as usize;
+            let height = (WINDOW_HEIGHT * scale).round() as usize;
+            let geometry =
+                geometry_with_notice(1.0, 0.0, ShapeStyle::Attached, scale, width as f32);
+            let presets = timer_presets(&geometry, scale);
+            let left = geometry.x + 28.0 * scale;
+            let right = geometry.x + geometry.width - 28.0 * scale;
+
+            assert!(
+                presets[0].x >= left - 0.01,
+                "first chip broke the left margin at scale {scale}"
+            );
+            assert!(
+                presets[4].x + presets[4].width <= right + 0.01,
+                "last chip broke the right margin at scale {scale}"
+            );
+            for pair in presets.windows(2) {
+                assert!(
+                    pair[1].x >= pair[0].x + pair[0].width,
+                    "preset chips overlap at scale {scale}"
+                );
+            }
+            for preset in presets {
+                assert!(preset.y >= geometry.y + 60.0 * scale);
+                assert!(preset.y + preset.height <= geometry.y + 104.0 * scale);
+            }
+
+            let view = test_view(
+                geometry,
+                scale,
+                &regular,
+                semibold.as_ref(),
+                1.0,
+                None,
+                None,
+            );
+            let pixmap = draw(width as u32, height as u32, &view).expect("render");
+            for preset in presets {
+                let center = (
+                    preset.x + preset.width / 2.0,
+                    preset.y + preset.height / 2.0,
+                );
+                assert!(
+                    has_bright_pixel_near(&pixmap, center, preset.height / 2.0),
+                    "preset '{}' is blank at scale {scale}",
+                    preset.label
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn expanded_timer_draws_a_depleting_bar_and_controls() {
+        let Some(regular) = test_font(&["segoeui.ttf", "arial.ttf"]) else {
+            return;
+        };
+        let semibold = test_font(&["seguisb.ttf", "segoeuib.ttf", "arialbd.ttf"]);
+
+        for scale in [1.0_f32, 1.3] {
+            let width = (WINDOW_WIDTH * scale).round() as usize;
+            let height = (WINDOW_HEIGHT * scale).round() as usize;
+            let geometry =
+                geometry_with_notice(1.0, 0.0, ShapeStyle::Attached, scale, width as f32);
+            let view = test_view(
+                geometry,
+                scale,
+                &regular,
+                semibold.as_ref(),
+                1.0,
+                None,
+                Some(TimerView {
+                    display: "2:30".to_string(),
+                    label: "Timer",
+                    progress: 0.5,
+                    countdown: true,
+                    running: true,
+                }),
+            );
+            let pixmap = draw(width as u32, height as u32, &view).expect("render");
+
+            let controls = timer_controls(&geometry, scale);
+            for (name, center) in [("pause", controls.pause), ("stop", controls.stop)] {
+                assert!(
+                    has_bright_pixel_near(&pixmap, center, controls.radius),
+                    "{name} control was not drawn at scale {scale}"
+                );
+            }
+
+            let left = geometry.x + 28.0 * scale;
+            let right = geometry.x + geometry.width - 28.0 * scale;
+            let bar_y = geometry.y + 62.0 * scale;
+            let half = (right - left) * 0.5;
+            let filled = amber_pixels_in(
+                &pixmap,
+                left,
+                bar_y - 2.0 * scale,
+                left + half,
+                bar_y + 6.0 * scale,
+            );
+            let missing = amber_pixels_in(
+                &pixmap,
+                left + half + 8.0 * scale,
+                bar_y - 2.0 * scale,
+                right,
+                bar_y + 6.0 * scale,
+            );
+            assert!(
+                filled >= (100.0 * scale * scale) as usize,
+                "timer progress bar is empty at scale {scale}: {filled} pixels"
+            );
+            assert_eq!(
+                missing, 0,
+                "timer progress bar passed its remaining fraction at scale {scale}"
+            );
+
+            let baseline = geometry.y + 112.0 * scale;
+            let status_band = (baseline - 12.0 * scale) as usize
+                ..((baseline + 4.0 * scale) as usize).min(pixmap.height() as usize);
+            let lit = lit_columns(&pixmap, status_band.start, status_band.end);
+            let left_half = lit[..pixmap.width() as usize / 2].iter().any(|on| *on);
+            let right_half = lit[pixmap.width() as usize / 2..].iter().any(|on| *on);
+            assert!(
+                left_half && right_half,
+                "status row disappeared under the timer card at scale {scale}"
+            );
+        }
+    }
+
+    #[test]
+    fn stopwatch_card_has_no_progress_bar() {
+        let Some(regular) = test_font(&["segoeui.ttf", "arial.ttf"]) else {
+            return;
+        };
+        let semibold = test_font(&["seguisb.ttf", "segoeuib.ttf", "arialbd.ttf"]);
+
+        for scale in [1.0_f32, 1.3] {
+            let width = (WINDOW_WIDTH * scale).round() as usize;
+            let height = (WINDOW_HEIGHT * scale).round() as usize;
+            let geometry =
+                geometry_with_notice(1.0, 0.0, ShapeStyle::Attached, scale, width as f32);
+            let view = test_view(
+                geometry,
+                scale,
+                &regular,
+                semibold.as_ref(),
+                1.0,
+                None,
+                Some(TimerView {
+                    display: "12:34".to_string(),
+                    label: "Stopwatch",
+                    progress: 0.0,
+                    countdown: false,
+                    running: true,
+                }),
+            );
+            let pixmap = draw(width as u32, height as u32, &view).expect("render");
+
+            let left = geometry.x + 28.0 * scale;
+            let right = geometry.x + geometry.width - 28.0 * scale;
+            let bar_y = geometry.y + 62.0 * scale;
+            let amber = amber_pixels_in(
+                &pixmap,
+                left,
+                bar_y - 2.0 * scale,
+                right,
+                bar_y + 6.0 * scale,
+            );
+            assert_eq!(amber, 0, "stopwatch drew a countdown bar at scale {scale}");
+        }
+    }
+
+    #[test]
+    fn timer_notice_uses_amber_and_shows_both_lines() {
+        let Some(regular) = test_font(&["segoeui.ttf", "arial.ttf"]) else {
+            return;
+        };
+        let semibold = test_font(&["seguisb.ttf", "segoeuib.ttf", "arialbd.ttf"]);
+
+        for scale in [1.0_f32, 1.3] {
+            let width = (WINDOW_WIDTH * scale).round() as usize;
+            let height = (WINDOW_HEIGHT * scale).round() as usize;
+            let geometry =
+                geometry_with_notice(0.0, 1.0, ShapeStyle::Attached, scale, width as f32);
+            let mut view = test_view(
+                geometry,
+                scale,
+                &regular,
+                semibold.as_ref(),
+                0.0,
+                None,
+                None,
+            );
+            view.notice_mix = 1.0;
+            view.notice_kind = Some(NoticeKind::Timer);
+            view.notice_title = Some("Timer");
+            view.notice_subtitle = Some("Time's up!");
+            let pixmap = draw(width as u32, height as u32, &view).expect("render");
+
+            let amber = amber_pixels_in(
+                &pixmap,
+                geometry.x,
+                geometry.y,
+                geometry.x + geometry.width,
+                geometry.y + geometry.height,
+            );
+            assert!(
+                amber >= (15.0 * scale * scale) as usize,
+                "timer notice icon is missing its amber accent at scale {scale}: {amber}"
+            );
+
+            let text_left = (geometry.x + 42.0 * scale) as usize;
+            let text_right = ((geometry.x + geometry.width - 12.0 * scale) as usize).min(width);
+            let text_top = (geometry.y + 8.0 * scale) as usize;
+            let text_bottom = (geometry.y + 48.0 * scale) as usize;
+            let lit = lit_columns(&pixmap, text_top, text_bottom);
+            let columns = lit[text_left.min(lit.len())..text_right.min(lit.len())]
+                .iter()
+                .filter(|on| **on)
+                .count();
+            assert!(
+                columns >= (20.0 * scale) as usize,
+                "timer notice text is missing at scale {scale}: {columns} columns"
+            );
+        }
     }
 }
