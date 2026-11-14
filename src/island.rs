@@ -10,7 +10,9 @@ const CORNER_K: f32 = 0.58;
 const SURFACE: ColorU8 = ColorU8::from_rgba(0, 0, 0, 255);
 const TEXT: ColorU8 = ColorU8::from_rgba(245, 244, 240, 250);
 const MUTED: ColorU8 = ColorU8::from_rgba(158, 157, 152, 205);
-const GREEN: ColorU8 = ColorU8::from_rgba(102, 224, 151, 255);
+/// Charging accent: a cool cyan that separates "plugged in" from the red
+/// low-battery state and the neutral white ring.
+const CYAN: ColorU8 = ColorU8::from_rgba(88, 202, 242, 255);
 const RED: ColorU8 = ColorU8::from_rgba(255, 99, 99, 255);
 /// ReyLand's timer accent: warm amber, distinct from the blue-ish white clock
 /// and the system accents used by the battery ring.
@@ -285,14 +287,14 @@ fn draw_collapsed(pixmap: &mut Pixmap, view: &IslandView<'_>, alpha: f32) {
     let label_size = 11.5 * s;
     let label_width = measure_text(regular, &label, label_size);
     let accent = if view.battery_charging {
-        GREEN
+        CYAN
     } else if percent <= 20 {
         RED
     } else {
         TEXT
     };
     let label_color = if view.battery_charging {
-        scale_alpha(GREEN, alpha)
+        scale_alpha(CYAN, alpha)
     } else if percent <= 20 {
         scale_alpha(RED, alpha)
     } else {
@@ -423,14 +425,14 @@ fn draw_expanded(pixmap: &mut Pixmap, view: &IslandView<'_>, alpha: f32) {
         let label_size = 15.5 * s;
         let label_width = measure_text(semibold, &label, label_size);
         let accent = if view.battery_charging {
-            GREEN
+            CYAN
         } else if percent <= 20 {
             RED
         } else {
             TEXT
         };
         let label_color = if view.battery_charging {
-            scale_alpha(GREEN, alpha)
+            scale_alpha(CYAN, alpha)
         } else if percent <= 20 {
             scale_alpha(RED, alpha)
         } else {
@@ -1110,7 +1112,9 @@ fn draw_waveform(
 /// Cover art with rounded corners. The source is sampled with a centred cover
 /// fit so non-square covers are cropped instead of stretched.
 fn draw_art(pixmap: &mut Pixmap, art: Option<&Pixmap>, x: f32, y: f32, size: f32, alpha: f32) {
-    let radius = size * 0.18;
+    // Tighter than a squircle: the artwork reads as a crisp tile inside the
+    // pill and card instead of a soft blob.
+    let radius = size * 0.13;
     let Some(art) = art.filter(|art| art.width() > 0 && art.height() > 0) else {
         fill_rounded_rect(
             pixmap,
@@ -1589,7 +1593,7 @@ fn draw_battery(
             cx,
             cy + radius * 0.02,
             radius * 1.15,
-            scale_alpha(GREEN, alpha),
+            scale_alpha(CYAN, alpha),
             scale_alpha(ColorU8::from_rgba(0, 0, 0, 255), alpha * 0.85),
         );
     }
@@ -2329,6 +2333,27 @@ mod tests {
         count
     }
 
+    /// Counts pixels that can only come from the cyan charging accent.
+    fn cyan_pixels_in(pixmap: &Pixmap, x0: f32, y0: f32, x1: f32, y1: f32) -> usize {
+        let width = pixmap.width() as i32;
+        let height = pixmap.height() as i32;
+        let x0 = (x0.floor() as i32).max(0);
+        let y0 = (y0.floor() as i32).max(0);
+        let x1 = (x1.ceil() as i32).min(width);
+        let y1 = (y1.ceil() as i32).min(height);
+        let mut count = 0;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let index = (y as usize * width as usize + x as usize) * 4;
+                let px = &pixmap.data()[index..index + 4];
+                if px[3] > 100 && px[0] < 160 && px[1] > 130 && px[2] > 190 && px[2] > px[0] + 60 {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
     #[test]
     fn collapsed_timer_replaces_the_clock_with_amber_and_a_live_value() {
         let Some(regular) = test_font(&["segoeui.ttf", "arial.ttf"]) else {
@@ -2611,6 +2636,63 @@ mod tests {
             assert!(
                 columns >= (20.0 * scale) as usize,
                 "timer notice text is missing at scale {scale}: {columns} columns"
+            );
+        }
+    }
+
+    #[test]
+    fn charging_battery_switches_to_the_cyan_accent() {
+        let Some(regular) = test_font(&["segoeui.ttf", "arial.ttf"]) else {
+            return;
+        };
+        let semibold = test_font(&["seguisb.ttf", "segoeuib.ttf", "arialbd.ttf"]);
+
+        for scale in [1.0_f32, 1.75] {
+            let width = (WINDOW_WIDTH * scale).round() as usize;
+            let height = (WINDOW_HEIGHT * scale).round() as usize;
+            let geometry =
+                geometry_with_notice(0.0, 0.0, ShapeStyle::Attached, scale, width as f32);
+            let mut view = test_view(
+                geometry,
+                scale,
+                &regular,
+                semibold.as_ref(),
+                0.0,
+                None,
+                None,
+            );
+            view.battery_percent = Some(42);
+
+            let neutral = draw(width as u32, height as u32, &view).expect("render");
+            let cyan = cyan_pixels_in(&neutral, 0.0, 0.0, width as f32, height as f32);
+            assert_eq!(
+                cyan, 0,
+                "a discharging battery picked up the cyan accent at scale {scale}"
+            );
+
+            view.battery_charging = true;
+            let charging = draw(width as u32, height as u32, &view).expect("render");
+            let cyan = cyan_pixels_in(&charging, 0.0, 0.0, width as f32, height as f32);
+            assert!(
+                cyan >= (40.0 * scale) as usize,
+                "charging battery is missing its cyan accent at scale {scale}: {cyan} pixels"
+            );
+
+            let right = geometry.x + geometry.width - 18.0 * scale;
+            let icon_x = right - 7.2 * scale;
+            let label_size = 11.5 * scale;
+            let label_width = measure_text(&regular, "42%", label_size);
+            let label_left = icon_x - 7.2 * scale - 7.0 * scale - label_width;
+            let center_y = geometry.y + geometry.height / 2.0;
+            let band_top = center_y + 5.5 * scale - 12.0 * scale;
+            let band_bottom = center_y + 5.5 * scale + 4.0 * scale;
+            let lit = lit_columns(&charging, band_top.max(0.0) as usize, band_bottom as usize);
+            assert!(
+                lit[(label_left.max(0.0) as usize).min(lit.len())
+                    ..((label_left + label_width) as usize).min(lit.len())]
+                    .iter()
+                    .any(|on| *on),
+                "charging label disappeared at scale {scale}"
             );
         }
     }
