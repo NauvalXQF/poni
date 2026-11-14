@@ -2,18 +2,20 @@
 
 mod geometry;
 mod island;
+mod media;
 mod network;
 mod surface;
 
 use std::ffi::c_void;
 use std::path::PathBuf;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use chrono::Local;
 use fontdue::{Font, FontSettings};
 use geometry::{geometry_with_notice, ShapeStyle, WINDOW_HEIGHT, WINDOW_WIDTH};
-use island::{draw as draw_island, IslandView, NoticeKind};
+use island::{draw as draw_island, media_controls, IslandView, MediaView, NoticeKind};
+use media::{spawn_worker as spawn_media_worker, MediaCommand, MediaState};
 use network::{spawn_worker as spawn_network_worker, NetworkState};
 use serde::{Deserialize, Serialize};
 use surface::LayeredSurface;
@@ -221,6 +223,13 @@ struct App {
     network_rx: Receiver<NetworkState>,
     network: NetworkState,
     network_initialized: bool,
+    media_rx: Receiver<MediaState>,
+    media_cmd: Sender<MediaCommand>,
+    media: MediaState,
+    /// When the latest media snapshot arrived, used to advance the progress
+    /// bar between the worker's polls.
+    media_received_at: Instant,
+    anim_start: Instant,
     notice: Option<Notice>,
     notice_closing: bool,
     pending_notice: Option<Notice>,
@@ -230,12 +239,16 @@ struct App {
     timer: HANDLE,
     refresh_hz: f32,
     last_tick: Instant,
+    /// Bounds of the last surface upload so each frame only touches the
+    /// capsule region instead of the whole 500x230 window.
+    last_present_rect: Option<(i32, i32, i32, i32)>,
 }
 
 impl App {
     fn new(timer: HANDLE) -> Self {
         let settings = load_settings();
         let network_rx = spawn_network_worker();
+        let (media_rx, media_cmd) = spawn_media_worker();
         Self {
             hwnd: HWND::default(),
             progress: 0.0,
@@ -260,6 +273,11 @@ impl App {
             network_rx,
             network: NetworkState::default(),
             network_initialized: false,
+            media_rx,
+            media_cmd,
+            media: MediaState::default(),
+            media_received_at: Instant::now(),
+            anim_start: Instant::now(),
             notice: None,
             notice_closing: false,
             pending_notice: None,
@@ -269,6 +287,7 @@ impl App {
             timer,
             refresh_hz: detect_refresh_rate(),
             last_tick: Instant::now(),
+            last_present_rect: None,
         }
     }
 
@@ -307,6 +326,7 @@ impl App {
         self.window_width = (WINDOW_WIDTH * scale).round() as i32;
         self.window_height = (WINDOW_HEIGHT * scale).round() as i32;
         self.hit_mask = vec![0; (self.window_width * self.window_height) as usize];
+        self.last_present_rect = None;
 
         self.surface = LayeredSurface::new(self.window_width, self.window_height)
             .map_err(|err| {
@@ -362,6 +382,23 @@ impl App {
         )
     }
 
+    /// Screen-space bounds of the capsule, padded for anti-aliased edges and
+    /// the attached flare. This is the only region the layered surface needs
+    /// to upload while content animates.
+    fn shape_rect(&self) -> (i32, i32, i32, i32) {
+        let geo = self.geometry();
+        let margin = 2.0;
+        let x0 = (geo.x - geo.flare - margin).floor().max(0.0) as i32;
+        let y0 = (geo.y - margin).floor().max(0.0) as i32;
+        let x1 = (geo.x + geo.width + geo.flare + margin)
+            .ceil()
+            .min(self.window_width as f32) as i32;
+        let y1 = (geo.y + geo.height + margin)
+            .ceil()
+            .min(self.window_height as f32) as i32;
+        (x0, y0, x1, y1)
+    }
+
     fn hit_test(&self, px: f32, py: f32) -> bool {
         let x = px.floor() as i32;
         let y = py.floor() as i32;
@@ -394,6 +431,7 @@ impl App {
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
             } else {
                 let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+                self.last_present_rect = None;
                 self.redraw();
                 self.request_frame();
             }
@@ -458,6 +496,70 @@ impl App {
             self.notice_closing = false;
         }
         self.request_frame();
+    }
+
+    /// Drains the media worker without ever blocking the render thread.
+    fn update_media_state(&mut self, now: Instant) -> bool {
+        let mut changed = false;
+        while let Ok(state) = self.media_rx.try_recv() {
+            if !state.differs(&self.media) {
+                continue;
+            }
+            if state.active
+                && (state.title != self.media.title || state.artist != self.media.artist)
+            {
+                log_line(&format!("media: {} - {}", state.title, state.artist));
+            }
+            self.media = state;
+            self.media_received_at = now;
+            changed = true;
+        }
+        changed
+    }
+
+    /// Extrapolates the last reported position so the progress bar moves at
+    /// frame rate instead of stepping with the 250ms poll.
+    fn media_position_ms(&self) -> u64 {
+        if !self.media.active {
+            return 0;
+        }
+        let mut position = self.media.position_ms;
+        if self.media.playing {
+            position = position.saturating_add(self.media_received_at.elapsed().as_millis() as u64);
+        }
+        if self.media.duration_ms > 0 {
+            position = position.min(self.media.duration_ms);
+        }
+        position
+    }
+
+    /// Transport buttons own their circle in the expanded media card; every
+    /// other click keeps the old pin behaviour.
+    unsafe fn handle_click(&mut self, px: f32, py: f32) {
+        if self.media.active && self.progress > 0.5 {
+            let controls = media_controls(&self.geometry(), self.effective_scale());
+            let hit = |(cx, cy): (f32, f32)| {
+                let dx = px - cx;
+                let dy = py - cy;
+                dx * dx + dy * dy <= controls.radius * controls.radius
+            };
+            let command = if hit(controls.play) {
+                Some(MediaCommand::PlayPause)
+            } else if hit(controls.previous) {
+                Some(MediaCommand::Previous)
+            } else if hit(controls.next) {
+                Some(MediaCommand::Next)
+            } else {
+                None
+            };
+            if let Some(command) = command {
+                log_line(&format!("media command: {command:?}"));
+                let _ = self.media_cmd.send(command);
+                self.request_frame();
+                return;
+            }
+        }
+        self.toggle_pin();
     }
 
     fn update_network_state(&mut self) {
@@ -545,6 +647,9 @@ impl App {
         let date = Local::now().format("%a, %d %b").to_string();
 
         let mut changed = self.update_system_status(false);
+        if self.update_media_state(now) {
+            changed = true;
+        }
         if self.time != clock {
             self.time = clock;
             changed = true;
@@ -572,6 +677,12 @@ impl App {
             changed = true;
         }
         if approach(&mut self.notice_mix, notice_target, dt, MOTION_RATE) {
+            changed = true;
+        }
+
+        // The pill waveform and the card progress bar move with the clock, so
+        // they need a frame even when no new media snapshot arrived.
+        if self.media.active && self.media.playing {
             changed = true;
         }
 
@@ -620,6 +731,16 @@ impl App {
 
         if animating {
             1000.0 / self.refresh_hz.max(30.0)
+        } else if self.media.active && self.media.playing {
+            if self.progress > 0.5 {
+                // Expanded card: the only motion is a 3px progress bar, so a
+                // slow cadence is visually identical and keeps the laptop cool.
+                100.0
+            } else {
+                // Pill waveform: 15fps is smooth for four bars with the slowed
+                // pulse, and costs a fraction of a 60fps redraw.
+                66.0
+            }
         } else if self.progress > 0.001 || self.notice_mix > 0.001 {
             33.0
         } else {
@@ -641,6 +762,15 @@ impl App {
                 device.name.clone()
             }
         });
+        let media_view =
+            (self.media.active && !self.media.title.trim().is_empty()).then(|| MediaView {
+                title: &self.media.title,
+                artist: &self.media.artist,
+                playing: self.media.playing,
+                position_ms: self.media_position_ms(),
+                duration_ms: self.media.duration_ms,
+                art: self.media.art.as_deref(),
+            });
         let view = IslandView {
             progress: self.progress,
             geometry: self.geometry(),
@@ -657,19 +787,32 @@ impl App {
             notice_subtitle: self.notice.as_ref().map(|notice| notice.subtitle.as_str()),
             notice_battery: self.notice.as_ref().and_then(|notice| notice.battery),
             notice_closing: self.notice_closing,
+            media: media_view,
+            anim: self.anim_start.elapsed().as_secs_f32(),
             regular: self.fonts.regular.as_ref(),
             semibold: self.fonts.semibold.as_ref(),
         };
 
+        let current = self.shape_rect();
+        let dirty = self.last_present_rect.map(|prev| union_rect(prev, current));
+        let update = dirty.unwrap_or((0, 0, self.window_width, self.window_height));
+
         if let Some(pixmap) = draw_island(surface.width as u32, surface.height as u32, &view) {
             if self.hit_mask.len() == (pixmap.width() * pixmap.height()) as usize {
-                let (pixels, _) = pixmap.data().as_chunks::<4>();
-                for (dst, src) in self.hit_mask.iter_mut().zip(pixels) {
-                    *dst = if src[3] > 127 { 255 } else { 0 };
+                let width = pixmap.width() as i32;
+                let data = pixmap.data();
+                let (x0, y0, x1, y1) = update;
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        let alpha = data[((y as usize * width as usize) + x as usize) * 4 + 3];
+                        self.hit_mask[(y as usize * width as usize) + x as usize] =
+                            if alpha > 127 { 255 } else { 0 };
+                    }
                 }
             }
-            surface.present(self.hwnd, &pixmap);
+            surface.present(self.hwnd, &pixmap, dirty);
         }
+        self.last_present_rect = Some(current);
         self.surface = Some(surface);
     }
 
@@ -854,6 +997,10 @@ fn approach(current: &mut f32, target: f32, dt: f32, rate: f32) -> bool {
         *current = target;
     }
     true
+}
+
+fn union_rect(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> (i32, i32, i32, i32) {
+    (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3))
 }
 
 fn dpi_scale(hwnd: HWND) -> f32 {
@@ -1067,7 +1214,9 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_LBUTTONUP => {
             if let Some(app) = app_mut(hwnd) {
-                app.toggle_pin();
+                let x = (lparam.0 & 0xffff) as i16 as i32;
+                let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
+                app.handle_click(x as f32, y as f32);
             }
             LRESULT(0)
         }

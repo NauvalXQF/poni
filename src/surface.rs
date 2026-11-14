@@ -8,7 +8,9 @@ use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS,
     HDC, HGDIOBJ,
 };
-use windows::Win32::UI::WindowsAndMessaging::{UpdateLayeredWindow, ULW_ALPHA};
+use windows::Win32::UI::WindowsAndMessaging::{
+    UpdateLayeredWindowIndirect, ULW_ALPHA, UPDATELAYEREDWINDOWINFO,
+};
 
 pub struct LayeredSurface {
     pub(crate) width: i32,
@@ -75,23 +77,45 @@ impl LayeredSurface {
         }
     }
 
-    pub fn present(&self, hwnd: HWND, pixmap: &Pixmap) {
+    pub fn present(&self, hwnd: HWND, pixmap: &Pixmap, dirty: Option<(i32, i32, i32, i32)>) {
         if pixmap.width() != self.width as u32 || pixmap.height() != self.height as u32 {
             return;
         }
 
+        let (x0, y0, x1, y1) = match dirty {
+            Some(rect) => (
+                rect.0.clamp(0, self.width),
+                rect.1.clamp(0, self.height),
+                rect.2.clamp(0, self.width),
+                rect.3.clamp(0, self.height),
+            ),
+            None => (0, 0, self.width, self.height),
+        };
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+
         unsafe {
-            let (src_pixels, _) = pixmap.data().as_chunks::<4>();
-            let (dst_pixels, _) = std::slice::from_raw_parts_mut(
+            let src = pixmap.data();
+            let dst = std::slice::from_raw_parts_mut(
                 self.bits,
                 (self.width as usize) * (self.height as usize) * 4,
-            )
-            .as_chunks_mut::<4>();
-            for (dst, src) in dst_pixels.iter_mut().zip(src_pixels) {
-                dst[0] = src[2];
-                dst[1] = src[1];
-                dst[2] = src[0];
-                dst[3] = src[3];
+            );
+            let row_bytes = self.width as usize * 4;
+            for y in y0 as usize..y1 as usize {
+                let start = y * row_bytes + x0 as usize * 4;
+                let end = y * row_bytes + x1 as usize * 4;
+                for (dst_px, src_px) in dst[start..end]
+                    .as_chunks_mut::<4>()
+                    .0
+                    .iter_mut()
+                    .zip(src[start..end].as_chunks::<4>().0)
+                {
+                    dst_px[0] = src_px[2];
+                    dst_px[1] = src_px[1];
+                    dst_px[2] = src_px[0];
+                    dst_px[3] = src_px[3];
+                }
             }
 
             let blend = BLENDFUNCTION {
@@ -105,17 +129,31 @@ impl LayeredSurface {
                 cy: self.height,
             };
             let src_point = POINT { x: 0, y: 0 };
-            let _ = UpdateLayeredWindow(
-                hwnd,
-                self.screen,
-                None,
-                Some(&size),
-                self.memory,
-                Some(&src_point),
-                COLORREF(0),
-                Some(&blend),
-                ULW_ALPHA,
-            );
+            let dirty_rect = windows::Win32::Foundation::RECT {
+                left: x0,
+                top: y0,
+                right: x1,
+                bottom: y1,
+            };
+            let info = UPDATELAYEREDWINDOWINFO {
+                cbSize: std::mem::size_of::<UPDATELAYEREDWINDOWINFO>() as u32,
+                hdcDst: self.screen,
+                pptDst: null_mut(),
+                psize: &size,
+                hdcSrc: self.memory,
+                pptSrc: &src_point,
+                crKey: COLORREF(0),
+                pblend: &blend,
+                dwFlags: ULW_ALPHA,
+                // Only the capsule region moves; leaving the rest of the
+                // layered surface alone keeps per-frame uploads small.
+                prcDirty: if dirty.is_some() {
+                    &dirty_rect
+                } else {
+                    null_mut()
+                },
+            };
+            let _ = UpdateLayeredWindowIndirect(hwnd, &info);
         }
     }
 }

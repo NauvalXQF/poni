@@ -20,6 +20,47 @@ pub enum NoticeKind {
     Airplane,
 }
 
+pub struct MediaView<'a> {
+    pub title: &'a str,
+    pub artist: &'a str,
+    pub playing: bool,
+    pub position_ms: u64,
+    pub duration_ms: u64,
+    pub art: Option<&'a Pixmap>,
+}
+
+impl MediaView<'_> {
+    /// Playback progress in the 0..=1 range, or zero when the length is unknown.
+    fn progress(&self) -> f32 {
+        if self.duration_ms == 0 {
+            return 0.0;
+        }
+        (self.position_ms as f32 / self.duration_ms as f32).clamp(0.0, 1.0)
+    }
+}
+
+/// Clickable circles for the expanded transport row, in surface coordinates.
+/// The renderer and the window procedure share this so a click always lands on
+/// the icon that was drawn.
+#[derive(Clone, Copy, Debug)]
+pub struct MediaControls {
+    pub previous: (f32, f32),
+    pub play: (f32, f32),
+    pub next: (f32, f32),
+    pub radius: f32,
+}
+
+pub fn media_controls(geo: &Geometry, scale: f32) -> MediaControls {
+    let cx = geo.x + geo.width / 2.0;
+    let cy = geo.y + 84.0 * scale;
+    MediaControls {
+        previous: (cx - 36.0 * scale, cy),
+        play: (cx, cy),
+        next: (cx + 36.0 * scale, cy),
+        radius: 16.0 * scale,
+    }
+}
+
 pub struct IslandView<'a> {
     pub progress: f32,
     pub geometry: Geometry,
@@ -36,6 +77,9 @@ pub struct IslandView<'a> {
     pub notice_subtitle: Option<&'a str>,
     pub notice_battery: Option<u8>,
     pub notice_closing: bool,
+    pub media: Option<MediaView<'a>>,
+    /// Monotonic seconds used to animate the live waveform.
+    pub anim: f32,
     pub regular: Option<&'a Font>,
     pub semibold: Option<&'a Font>,
 }
@@ -145,6 +189,11 @@ fn draw_collapsed(pixmap: &mut Pixmap, view: &IslandView<'_>, alpha: f32) {
         scale_alpha(TEXT, alpha),
     );
 
+    if let Some(media) = view.media.as_ref() {
+        draw_compact_media(pixmap, view, media, right, alpha);
+        return;
+    }
+
     let Some(percent) = view.battery_percent else {
         return;
     };
@@ -201,6 +250,12 @@ fn draw_expanded(pixmap: &mut Pixmap, view: &IslandView<'_>, alpha: f32) {
     let left = geo.x + 28.0 * s;
     let right = geo.x + geo.width - 28.0 * s;
     let top = geo.y;
+
+    if let Some(media) = view.media.as_ref() {
+        draw_expanded_media(pixmap, view, media, regular, semibold, alpha);
+        draw_expanded_status(pixmap, view, regular, alpha);
+        return;
+    }
 
     draw_text(
         pixmap,
@@ -263,7 +318,19 @@ fn draw_expanded(pixmap: &mut Pixmap, view: &IslandView<'_>, alpha: f32) {
         );
     }
 
-    let baseline = top + 112.0 * s;
+    draw_expanded_status(pixmap, view, regular, alpha);
+}
+
+/// Wi-Fi on the left and Bluetooth on the right, sharing the baseline of the
+/// clock layout so the two views line up when media takes over the expanded
+/// card.
+fn draw_expanded_status(pixmap: &mut Pixmap, view: &IslandView<'_>, regular: &Font, alpha: f32) {
+    let s = view.scale;
+    let geo = view.geometry;
+    let left = geo.x + 28.0 * s;
+    let right = geo.x + geo.width - 28.0 * s;
+
+    let baseline = geo.y + 112.0 * s;
     let column_width = ((right - left) * 0.5 - 12.0 * s).max(0.0);
 
     let wifi = view.wifi.unwrap_or("Wi-Fi off");
@@ -311,6 +378,571 @@ fn draw_expanded(pixmap: &mut Pixmap, view: &IslandView<'_>, alpha: f32) {
         17.0 * s,
         scale_alpha(bluetooth_color, alpha),
     );
+}
+
+/// Compact pill: clock on the left, elided track title in the middle, live
+/// waveform and cover art on the right. Everything shares the 34px height so
+/// the capsule never grows for media.
+fn draw_compact_media(
+    pixmap: &mut Pixmap,
+    view: &IslandView<'_>,
+    media: &MediaView<'_>,
+    right: f32,
+    alpha: f32,
+) {
+    let Some(regular) = view.regular.or(view.semibold) else {
+        return;
+    };
+    let semibold = view.semibold.unwrap_or(regular);
+    let s = view.scale;
+    let geo = view.geometry;
+    let center_y = geo.y + geo.height / 2.0;
+
+    let art_size = 19.0 * s;
+    let art_x = right - art_size;
+    draw_art(
+        pixmap,
+        media.art,
+        art_x,
+        center_y - art_size / 2.0,
+        art_size,
+        alpha,
+    );
+
+    let wave_gap = 7.0 * s;
+    let wave_width = 16.0 * s;
+    let wave_left = art_x - wave_gap - wave_width;
+    if media.playing {
+        draw_waveform(
+            pixmap,
+            wave_left,
+            center_y,
+            wave_width,
+            11.0 * s,
+            view.anim,
+            scale_alpha(TEXT, alpha * 0.9),
+        );
+    }
+
+    let title_left = geo.x + 18.0 * s + measure_text(semibold, &view.time, 15.5 * s) + 9.0 * s;
+    let title_right = if media.playing {
+        wave_left - 7.0 * s
+    } else {
+        art_x - 8.0 * s
+    };
+    let max_width = title_right - title_left;
+    if max_width < 14.0 * s {
+        return;
+    }
+    let title = elide(regular, media.title, 10.5 * s, max_width);
+    draw_text(
+        pixmap,
+        regular,
+        &title,
+        title_left,
+        center_y + 3.7 * s,
+        10.5 * s,
+        scale_alpha(TEXT, alpha * 0.86),
+    );
+}
+
+/// Expanded card: cover art, title/artist, progress, transport controls, and
+/// the status row underneath. The vertical rhythm is fixed so the waveform
+/// card and the clock card swap without the status row jumping.
+fn draw_expanded_media(
+    pixmap: &mut Pixmap,
+    view: &IslandView<'_>,
+    media: &MediaView<'_>,
+    regular: &Font,
+    semibold: &Font,
+    alpha: f32,
+) {
+    let s = view.scale;
+    let geo = view.geometry;
+    let left = geo.x + 28.0 * s;
+    let right = geo.x + geo.width - 28.0 * s;
+    let top = geo.y;
+
+    let art_size = 40.0 * s;
+    let art_x = left;
+    let art_y = top + 14.0 * s;
+    draw_art(pixmap, media.art, art_x, art_y, art_size, alpha);
+
+    let text_left = art_x + art_size + 12.0 * s;
+    let duration = format_time(media.duration_ms);
+    let duration_width = if media.duration_ms > 0 {
+        measure_text(regular, &duration, 9.5 * s)
+    } else {
+        0.0
+    };
+    let text_right = right
+        - if duration_width > 0.0 {
+            duration_width + 12.0 * s
+        } else {
+            0.0
+        };
+    let text_width = (text_right - text_left).max(0.0);
+
+    let title = elide(semibold, media.title, 14.5 * s, text_width);
+    draw_text(
+        pixmap,
+        semibold,
+        &title,
+        text_left,
+        art_y + 18.0 * s,
+        14.5 * s,
+        scale_alpha(TEXT, alpha),
+    );
+
+    let artist = if media.artist.trim().is_empty() {
+        "Unknown artist"
+    } else {
+        media.artist
+    };
+    let artist = elide(regular, artist, 10.5 * s, text_width);
+    draw_text(
+        pixmap,
+        regular,
+        &artist,
+        text_left,
+        art_y + 34.0 * s,
+        10.5 * s,
+        scale_alpha(MUTED, alpha),
+    );
+
+    if duration_width > 0.0 {
+        draw_text(
+            pixmap,
+            regular,
+            &duration,
+            right - duration_width,
+            art_y + 34.0 * s,
+            9.5 * s,
+            scale_alpha(MUTED, alpha),
+        );
+    }
+
+    let bar_y = top + 62.0 * s;
+    let bar_height = 3.0 * s;
+    let bar_radius = bar_height / 2.0;
+    fill_rounded_rect(
+        pixmap,
+        left,
+        bar_y,
+        right - left,
+        bar_height,
+        bar_radius,
+        ColorU8::from_rgba(255, 255, 255, (46.0 * alpha) as u8),
+    );
+    let progress = media.progress();
+    if progress > 0.001 {
+        fill_rounded_rect(
+            pixmap,
+            left,
+            bar_y,
+            (right - left) * progress,
+            bar_height,
+            bar_radius,
+            scale_alpha(TEXT, alpha),
+        );
+    }
+
+    let controls = media_controls(&geo, s);
+    let icon_color = scale_alpha(TEXT, alpha);
+    draw_filled_circle(
+        pixmap,
+        controls.play.0,
+        controls.play.1,
+        14.0 * s,
+        ColorU8::from_rgba(255, 255, 255, (22.0 * alpha) as u8),
+    );
+    draw_transport_icon(
+        pixmap,
+        if media.playing {
+            PlaybackIcon::Pause
+        } else {
+            PlaybackIcon::Play
+        },
+        controls.play.0,
+        controls.play.1,
+        13.0 * s,
+        icon_color,
+    );
+    draw_transport_icon(
+        pixmap,
+        PlaybackIcon::Previous,
+        controls.previous.0,
+        controls.previous.1,
+        11.0 * s,
+        scale_alpha(TEXT, alpha * 0.85),
+    );
+    draw_transport_icon(
+        pixmap,
+        PlaybackIcon::Next,
+        controls.next.0,
+        controls.next.1,
+        11.0 * s,
+        scale_alpha(TEXT, alpha * 0.85),
+    );
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PlaybackIcon {
+    Previous,
+    Play,
+    Pause,
+    Next,
+}
+
+fn draw_transport_icon(
+    pixmap: &mut Pixmap,
+    icon: PlaybackIcon,
+    cx: f32,
+    cy: f32,
+    size: f32,
+    color: ColorU8,
+) {
+    match icon {
+        PlaybackIcon::Play => fill_triangle(
+            pixmap,
+            (cx - size * 0.34, cy - size * 0.5),
+            (cx - size * 0.34, cy + size * 0.5),
+            (cx + size * 0.5, cy),
+            color,
+        ),
+        PlaybackIcon::Pause => {
+            let bar_width = size * 0.24;
+            let bar_height = size * 0.92;
+            fill_rounded_rect(
+                pixmap,
+                cx - size * 0.32,
+                cy - bar_height / 2.0,
+                bar_width,
+                bar_height,
+                bar_width * 0.35,
+                color,
+            );
+            fill_rounded_rect(
+                pixmap,
+                cx + size * 0.08,
+                cy - bar_height / 2.0,
+                bar_width,
+                bar_height,
+                bar_width * 0.35,
+                color,
+            );
+        }
+        PlaybackIcon::Previous => {
+            fill_rounded_rect(
+                pixmap,
+                cx - size * 0.62,
+                cy - size * 0.45,
+                size * 0.16,
+                size * 0.9,
+                size * 0.08,
+                color,
+            );
+            fill_triangle(
+                pixmap,
+                (cx + size * 0.5, cy - size * 0.45),
+                (cx + size * 0.5, cy + size * 0.45),
+                (cx - size * 0.42, cy),
+                color,
+            );
+        }
+        PlaybackIcon::Next => {
+            fill_rounded_rect(
+                pixmap,
+                cx + size * 0.46,
+                cy - size * 0.45,
+                size * 0.16,
+                size * 0.9,
+                size * 0.08,
+                color,
+            );
+            fill_triangle(
+                pixmap,
+                (cx - size * 0.5, cy - size * 0.45),
+                (cx - size * 0.5, cy + size * 0.45),
+                (cx + size * 0.42, cy),
+                color,
+            );
+        }
+    }
+}
+
+/// Placeholder artwork for tracks that have no cover: a small beamed note.
+fn draw_note(pixmap: &mut Pixmap, x: f32, y: f32, size: f32, color: ColorU8) {
+    let head_radius = size * 0.105;
+    let head_x = x + size * 0.38;
+    let head_y = y + size * 0.66;
+    draw_filled_circle(pixmap, head_x, head_y, head_radius, color);
+
+    let stem_width = size * 0.06;
+    let stem_x = head_x + head_radius * 0.72;
+    let stem_top = y + size * 0.27;
+    let stem_height = head_y - stem_top;
+    fill_rounded_rect(
+        pixmap,
+        stem_x,
+        stem_top,
+        stem_width,
+        stem_height,
+        stem_width * 0.5,
+        color,
+    );
+    fill_triangle(
+        pixmap,
+        (stem_x + stem_width, stem_top),
+        (stem_x + stem_width, stem_top + size * 0.15),
+        (stem_x + size * 0.17, stem_top + size * 0.06),
+        color,
+    );
+}
+
+/// A four-bar equaliser. Heights are driven by the same monotonic clock that
+/// paces the render loop, so the motion is smooth at any refresh rate.
+fn draw_waveform(
+    pixmap: &mut Pixmap,
+    x: f32,
+    center_y: f32,
+    width: f32,
+    height: f32,
+    anim: f32,
+    color: ColorU8,
+) {
+    const BARS: usize = 4;
+    /// Fixed silhouette so the bars always read as an equaliser; the pulse
+    /// only breathes around it.
+    const SHAPE: [f32; BARS] = [0.55, 1.0, 0.78, 0.42];
+    let gap = (width * 0.16).max(1.5);
+    let bar_width = ((width - gap * (BARS as f32 - 1.0)) / BARS as f32).max(1.0);
+    let radius = bar_width / 2.0;
+    for bar in 0..BARS {
+        let phase = anim * 2.8 + bar as f32 * 1.35;
+        let pulse = 0.55 + 0.45 * (0.5 + 0.5 * phase.sin());
+        let bar_height = height * (SHAPE[bar] * pulse).clamp(0.25, 1.0);
+        fill_rounded_rect(
+            pixmap,
+            x + bar as f32 * (bar_width + gap),
+            center_y - bar_height / 2.0,
+            bar_width,
+            bar_height,
+            radius,
+            color,
+        );
+    }
+}
+
+/// Cover art with rounded corners. The source is sampled with a centred cover
+/// fit so non-square covers are cropped instead of stretched.
+fn draw_art(pixmap: &mut Pixmap, art: Option<&Pixmap>, x: f32, y: f32, size: f32, alpha: f32) {
+    let radius = size * 0.18;
+    let Some(art) = art.filter(|art| art.width() > 0 && art.height() > 0) else {
+        fill_rounded_rect(
+            pixmap,
+            x,
+            y,
+            size,
+            size,
+            radius,
+            ColorU8::from_rgba(255, 255, 255, (22.0 * alpha) as u8),
+        );
+        draw_note(
+            pixmap,
+            x,
+            y,
+            size,
+            ColorU8::from_rgba(255, 255, 255, (140.0 * alpha) as u8),
+        );
+        return;
+    };
+
+    let cover = (art.width() as f32 / size).max(art.height() as f32 / size);
+    let src_cx = art.width() as f32 / 2.0;
+    let src_cy = art.height() as f32 / 2.0;
+    let dst_cx = x + size / 2.0;
+    let dst_cy = y + size / 2.0;
+
+    let x0 = x.floor().max(0.0) as i32;
+    let y0 = y.floor().max(0.0) as i32;
+    let x1 = (x + size).ceil().min(pixmap.width() as f32) as i32;
+    let y1 = (y + size).ceil().min(pixmap.height() as f32) as i32;
+
+    for py in y0..y1 {
+        for px in x0..x1 {
+            let sample_x = px as f32 + 0.5;
+            let sample_y = py as f32 + 0.5;
+            let coverage = rounded_rect_coverage(sample_x, sample_y, x, y, size, size, radius);
+            if coverage <= 0.0 {
+                continue;
+            }
+            let source = sample_bilinear(
+                art,
+                src_cx + (sample_x - dst_cx) * cover,
+                src_cy + (sample_y - dst_cy) * cover,
+            );
+            blend_art_pixel(pixmap, px, py, source, coverage * alpha);
+        }
+    }
+}
+
+/// Signed distance to a rounded rectangle, converted to one-pixel coverage.
+fn rounded_rect_coverage(px: f32, py: f32, x: f32, y: f32, w: f32, h: f32, radius: f32) -> f32 {
+    let half_w = w / 2.0;
+    let half_h = h / 2.0;
+    let radius = radius.min(half_w).min(half_h).max(0.0);
+    let qx = (px - (x + half_w)).abs() - (half_w - radius);
+    let qy = (py - (y + half_h)).abs() - (half_h - radius);
+    let outside = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt();
+    let inside = qx.max(qy).min(0.0);
+    let distance = outside + inside - radius;
+    (0.5 - distance).clamp(0.0, 1.0)
+}
+
+/// Bilinear sample of premultiplied RGBA, clamped to the artwork edges.
+fn sample_bilinear(pixmap: &Pixmap, u: f32, v: f32) -> [f32; 4] {
+    let width = pixmap.width() as i32;
+    let height = pixmap.height() as i32;
+    let max_x = width - 1;
+    let max_y = height - 1;
+    let u = u.clamp(0.0, max_x as f32);
+    let v = v.clamp(0.0, max_y as f32);
+    let x0 = u.floor() as i32;
+    let y0 = v.floor() as i32;
+    let x1 = (x0 + 1).min(max_x);
+    let y1 = (y0 + 1).min(max_y);
+    let fx = u - x0 as f32;
+    let fy = v - y0 as f32;
+
+    let data = pixmap.data();
+    let fetch = |x: i32, y: i32| {
+        let index = (y as usize * width as usize + x as usize) * 4;
+        [
+            data[index] as f32,
+            data[index + 1] as f32,
+            data[index + 2] as f32,
+            data[index + 3] as f32,
+        ]
+    };
+    let top_left = fetch(x0, y0);
+    let top_right = fetch(x1, y0);
+    let bottom_left = fetch(x0, y1);
+    let bottom_right = fetch(x1, y1);
+
+    let mut result = [0.0; 4];
+    for channel in 0..4 {
+        let top = top_left[channel] + (top_right[channel] - top_left[channel]) * fx;
+        let bottom = bottom_left[channel] + (bottom_right[channel] - bottom_left[channel]) * fx;
+        result[channel] = top + (bottom - top) * fy;
+    }
+    result
+}
+
+/// Blends one premultiplied art sample over the opaque black surface.
+fn blend_art_pixel(pixmap: &mut Pixmap, x: i32, y: i32, source: [f32; 4], opacity: f32) {
+    if x < 0 || y < 0 || x >= pixmap.width() as i32 || y >= pixmap.height() as i32 {
+        return;
+    }
+    let opacity = opacity.clamp(0.0, 1.0);
+    let width = pixmap.width() as usize;
+    let index = (y as usize * width + x as usize) * 4;
+    let data = pixmap.data_mut();
+    let alpha = source[3] * opacity;
+    let inverse = 255.0 - alpha;
+    data[index] =
+        (source[0] * opacity + data[index] as f32 * inverse / 255.0).clamp(0.0, 255.0) as u8;
+    data[index + 1] =
+        (source[1] * opacity + data[index + 1] as f32 * inverse / 255.0).clamp(0.0, 255.0) as u8;
+    data[index + 2] =
+        (source[2] * opacity + data[index + 2] as f32 * inverse / 255.0).clamp(0.0, 255.0) as u8;
+    data[index + 3] = (alpha + data[index + 3] as f32 * inverse / 255.0).clamp(0.0, 255.0) as u8;
+}
+
+fn fill_triangle(pixmap: &mut Pixmap, a: (f32, f32), b: (f32, f32), c: (f32, f32), color: ColorU8) {
+    let mut pb = PathBuilder::new();
+    pb.move_to(a.0, a.1);
+    pb.line_to(b.0, b.1);
+    pb.line_to(c.0, c.1);
+    pb.close();
+    if let Some(path) = pb.finish() {
+        fill_path(pixmap, &path, color);
+    }
+}
+
+fn fill_rounded_rect(
+    pixmap: &mut Pixmap,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    radius: f32,
+    color: ColorU8,
+) {
+    if width <= 0.0 || height <= 0.0 || color.alpha() == 0 {
+        return;
+    }
+    let Some(path) = rounded_rect_path(x, y, width, height, radius) else {
+        return;
+    };
+    fill_path(pixmap, &path, color);
+}
+
+fn rounded_rect_path(x: f32, y: f32, width: f32, height: f32, radius: f32) -> Option<Path> {
+    if width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+    let radius = radius.min(width / 2.0).min(height / 2.0).max(0.0);
+    let k = radius * 0.552_284_8;
+    let mut pb = PathBuilder::new();
+    pb.move_to(x + radius, y);
+    pb.line_to(x + width - radius, y);
+    pb.cubic_to(
+        x + width - radius + k,
+        y,
+        x + width,
+        y + radius - k,
+        x + width,
+        y + radius,
+    );
+    pb.line_to(x + width, y + height - radius);
+    pb.cubic_to(
+        x + width,
+        y + height - radius + k,
+        x + width - radius + k,
+        y + height,
+        x + width - radius,
+        y + height,
+    );
+    pb.line_to(x + radius, y + height);
+    pb.cubic_to(
+        x + radius - k,
+        y + height,
+        x,
+        y + height - radius + k,
+        x,
+        y + height - radius,
+    );
+    pb.line_to(x, y + radius);
+    pb.cubic_to(x, y + radius - k, x + radius - k, y, x + radius, y);
+    pb.close();
+    pb.finish()
+}
+
+fn fill_path(pixmap: &mut Pixmap, path: &Path, color: ColorU8) {
+    let mut paint = Paint::default();
+    paint.set_color(Color::from_rgba8(
+        color.red(),
+        color.green(),
+        color.blue(),
+        color.alpha(),
+    ));
+    pixmap.fill_path(path, &paint, FillRule::Winding, Transform::identity(), None);
+}
+
+fn format_time(milliseconds: u64) -> String {
+    let total = milliseconds / 1000;
+    format!("{}:{:02}", total / 60, total % 60)
 }
 
 fn draw_notice(pixmap: &mut Pixmap, view: &IslandView<'_>, alpha: f32) {
@@ -978,6 +1610,8 @@ mod tests {
                 notice_subtitle: None,
                 notice_battery: None,
                 notice_closing: false,
+                media: None,
+                anim: 0.0,
                 regular: Some(&regular),
                 semibold: semibold.as_ref(),
             };
@@ -1034,5 +1668,227 @@ mod tests {
                 "Wi-Fi icon shrank to {icon_width}px at scale {scale}"
             );
         }
+    }
+
+    fn test_art() -> Pixmap {
+        let mut art = Pixmap::new(24, 24).expect("art pixmap");
+        for pixel in art.data_mut().chunks_exact_mut(4) {
+            pixel.copy_from_slice(&[232, 120, 48, 255]);
+        }
+        art
+    }
+
+    /// Counts pixels whose colour can only come from the orange test artwork.
+    fn art_columns(pixmap: &Pixmap) -> (usize, usize, usize) {
+        let width = pixmap.width() as usize;
+        let height = pixmap.height() as usize;
+        let mut first = width;
+        let mut last = 0;
+        let mut count = 0;
+        for y in 0..height {
+            for x in 0..width {
+                let px = &pixmap.data()[(y * width + x) * 4..(y * width + x) * 4 + 4];
+                if px[0] > 140 && px[1] < 175 && px[2] < 120 {
+                    count += 1;
+                    first = first.min(x);
+                    last = last.max(x);
+                }
+            }
+        }
+        (first, last, count)
+    }
+
+    fn has_bright_pixel_near(pixmap: &Pixmap, center: (f32, f32), radius: f32) -> bool {
+        let width = pixmap.width() as i32;
+        let height = pixmap.height() as i32;
+        let x0 = (center.0 - radius).floor().max(0.0) as i32;
+        let y0 = (center.1 - radius).floor().max(0.0) as i32;
+        let x1 = ((center.0 + radius).ceil() as i32).min(width);
+        let y1 = ((center.1 + radius).ceil() as i32).min(height);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let index = (y as usize * width as usize + x as usize) * 4;
+                let px = &pixmap.data()[index..index + 4];
+                if px[3] > 40 && px[0] > 120 && px[1] > 120 && px[2] > 120 {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn transport_controls_stay_inside_the_expanded_card() {
+        for scale in [1.0_f32, 1.3, 1.75] {
+            let geo =
+                geometry_with_notice(1.0, 0.0, ShapeStyle::Attached, scale, WINDOW_WIDTH * scale);
+            let controls = media_controls(&geo, scale);
+            let margin = 28.0 * scale;
+            let left = geo.x + margin;
+            let right = geo.x + geo.width - margin;
+
+            assert!(
+                controls.previous.0 - controls.radius >= left,
+                "previous button broke the left margin at scale {scale}"
+            );
+            assert!(
+                controls.next.0 + controls.radius <= right,
+                "next button broke the right margin at scale {scale}"
+            );
+            assert!(
+                controls.play.1 + controls.radius <= geo.y + 104.0 * scale,
+                "transport row collided with the status row at scale {scale}"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_media_keeps_art_inside_the_pill() {
+        let Some(regular) = test_font(&["segoeui.ttf", "arial.ttf"]) else {
+            return;
+        };
+        let semibold = test_font(&["seguisb.ttf", "segoeuib.ttf", "arialbd.ttf"]);
+        let art = test_art();
+
+        for scale in [1.0_f32, 1.3] {
+            let width = (WINDOW_WIDTH * scale).round() as usize;
+            let height = (WINDOW_HEIGHT * scale).round() as usize;
+            let geometry =
+                geometry_with_notice(0.0, 0.0, ShapeStyle::Attached, scale, width as f32);
+            let view = IslandView {
+                progress: 0.0,
+                geometry,
+                scale,
+                time: "09:41".to_string(),
+                date: "Kam, 12 Nov".to_string(),
+                battery_percent: Some(87),
+                battery_charging: false,
+                wifi: Some("Wi-Fi"),
+                bluetooth: None,
+                notice_mix: 0.0,
+                notice_kind: None,
+                notice_title: None,
+                notice_subtitle: None,
+                notice_battery: None,
+                notice_closing: false,
+                media: Some(MediaView {
+                    title: "Midnight City Lights",
+                    artist: "The Paper Kites",
+                    playing: true,
+                    position_ms: 62_000,
+                    duration_ms: 214_000,
+                    art: Some(&art),
+                }),
+                anim: 1.2,
+                regular: Some(&regular),
+                semibold: semibold.as_ref(),
+            };
+            let pixmap = draw(width as u32, height as u32, &view).expect("render");
+
+            let (first, last, count) = art_columns(&pixmap);
+            assert!(
+                count >= (200.0 * scale * scale) as usize,
+                "cover art is missing at scale {scale}: {count} pixels"
+            );
+            let right = geometry.x + geometry.width;
+            assert!(
+                first as f32 >= right - 41.0 * scale,
+                "art drifted too far left at scale {scale}: {first}"
+            );
+            assert!(
+                last as f32 <= right - 16.0 * scale,
+                "art broke the right margin at scale {scale}: {last}"
+            );
+        }
+    }
+
+    #[test]
+    fn expanded_media_draws_art_transport_and_status_row() {
+        let Some(regular) = test_font(&["segoeui.ttf", "arial.ttf"]) else {
+            return;
+        };
+        let semibold = test_font(&["seguisb.ttf", "segoeuib.ttf", "arialbd.ttf"]);
+        let art = test_art();
+
+        for scale in [1.0_f32, 1.3] {
+            let width = (WINDOW_WIDTH * scale).round() as usize;
+            let height = (WINDOW_HEIGHT * scale).round() as usize;
+            let geometry =
+                geometry_with_notice(1.0, 0.0, ShapeStyle::Attached, scale, width as f32);
+            let view = IslandView {
+                progress: 1.0,
+                geometry,
+                scale,
+                time: "09:41".to_string(),
+                date: "Kam, 12 Nov".to_string(),
+                battery_percent: Some(87),
+                battery_charging: false,
+                wifi: Some("Kost Putri Anggrek 5G"),
+                bluetooth: Some("Sony WH-1000XM5"),
+                notice_mix: 0.0,
+                notice_kind: None,
+                notice_title: None,
+                notice_subtitle: None,
+                notice_battery: None,
+                notice_closing: false,
+                media: Some(MediaView {
+                    title: "Midnight City Lights",
+                    artist: "The Paper Kites",
+                    playing: true,
+                    position_ms: 62_000,
+                    duration_ms: 214_000,
+                    art: Some(&art),
+                }),
+                anim: 1.2,
+                regular: Some(&regular),
+                semibold: semibold.as_ref(),
+            };
+            let pixmap = draw(width as u32, height as u32, &view).expect("render");
+
+            let (first, last, count) = art_columns(&pixmap);
+            assert!(
+                count >= (1000.0 * scale * scale) as usize,
+                "expanded cover art is missing at scale {scale}: {count} pixels"
+            );
+            assert!(
+                first as f32 >= geometry.x + 26.0 * scale,
+                "art broke the left margin at scale {scale}: {first}"
+            );
+            assert!(
+                last as f32 <= geometry.x + 70.0 * scale,
+                "art grew past its column at scale {scale}: {last}"
+            );
+
+            let controls = media_controls(&geometry, scale);
+            for (name, center) in [
+                ("previous", controls.previous),
+                ("play", controls.play),
+                ("next", controls.next),
+            ] {
+                assert!(
+                    has_bright_pixel_near(&pixmap, center, controls.radius),
+                    "{name} control was not drawn at scale {scale}"
+                );
+            }
+
+            let baseline = geometry.y + 112.0 * scale;
+            let status_band = (baseline - 12.0 * scale) as usize
+                ..((baseline + 4.0 * scale) as usize).min(pixmap.height() as usize);
+            let lit = lit_columns(&pixmap, status_band.start, status_band.end);
+            let left_half = lit[..pixmap.width() as usize / 2].iter().any(|on| *on);
+            let right_half = lit[pixmap.width() as usize / 2..].iter().any(|on| *on);
+            assert!(
+                left_half && right_half,
+                "status row disappeared under the media card at scale {scale}"
+            );
+        }
+    }
+
+    #[test]
+    fn playback_times_are_minutes_and_seconds() {
+        assert_eq!(format_time(0), "0:00");
+        assert_eq!(format_time(9_400), "0:09");
+        assert_eq!(format_time(62_000), "1:02");
+        assert_eq!(format_time(3_599_000), "59:59");
     }
 }
