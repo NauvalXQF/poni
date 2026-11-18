@@ -52,10 +52,10 @@ pub struct TimerPreset {
 /// lands on the chip that was drawn.
 pub fn timer_presets(geo: &Geometry, scale: f32) -> [TimerPreset; 5] {
     const DEFS: [(&str, Option<u64>); 5] = [
-        ("1m", Some(60)),
-        ("5m", Some(300)),
-        ("10m", Some(600)),
-        ("25m", Some(1500)),
+        ("1 min", Some(60)),
+        ("5 min", Some(300)),
+        ("10 min", Some(600)),
+        ("25 min", Some(1500)),
         ("Stopwatch", None),
     ];
     let s = scale;
@@ -611,15 +611,14 @@ fn draw_expanded_media(
     draw_art(pixmap, media.art, art_x, art_y, art_size, alpha);
 
     let text_left = art_x + art_size + 12.0 * s;
-    let duration = format_time(media.duration_ms);
-    let duration_width = if media.duration_ms > 0 {
-        measure_text(regular, &duration, 9.5 * s)
-    } else {
-        0.0
-    };
+    let remaining = remaining_time(media.duration_ms, media.position_ms);
+    let remaining_width = remaining
+        .as_ref()
+        .map(|remaining| measure_text(regular, remaining, 9.5 * s))
+        .unwrap_or(0.0);
     let text_right = right
-        - if duration_width > 0.0 {
-            duration_width + 12.0 * s
+        - if remaining_width > 0.0 {
+            remaining_width + 12.0 * s
         } else {
             0.0
         };
@@ -652,12 +651,12 @@ fn draw_expanded_media(
         scale_alpha(MUTED, alpha),
     );
 
-    if duration_width > 0.0 {
+    if let Some(remaining) = remaining.as_ref() {
         draw_text(
             pixmap,
             regular,
-            &duration,
-            right - duration_width,
+            remaining,
+            right - remaining_width,
             art_y + 34.0 * s,
             9.5 * s,
             scale_alpha(MUTED, alpha),
@@ -1319,7 +1318,25 @@ fn fill_path(pixmap: &mut Pixmap, path: &Path, color: ColorU8) {
 
 fn format_time(milliseconds: u64) -> String {
     let total = milliseconds / 1000;
-    format!("{}:{:02}", total / 60, total % 60)
+    if total >= 3600 {
+        format!(
+            "{}:{:02}:{:02}",
+            total / 3600,
+            (total / 60) % 60,
+            total % 60
+        )
+    } else {
+        format!("{}:{:02}", total / 60, total % 60)
+    }
+}
+
+/// Countdown-style label for the expanded card. The leading minus makes it
+/// read as time left at a glance instead of an ambiguous timestamp.
+fn remaining_time(duration_ms: u64, position_ms: u64) -> Option<String> {
+    (duration_ms > 0).then(|| {
+        let remaining = duration_ms.saturating_sub(position_ms);
+        format!("-{}", format_time(remaining))
+    })
 }
 
 fn draw_notice(pixmap: &mut Pixmap, view: &IslandView<'_>, alpha: f32) {
@@ -2276,6 +2293,24 @@ mod tests {
         assert_eq!(format_time(9_400), "0:09");
         assert_eq!(format_time(62_000), "1:02");
         assert_eq!(format_time(3_599_000), "59:59");
+        assert_eq!(format_time(3_723_000), "1:02:03");
+    }
+
+    #[test]
+    fn media_time_left_reads_as_a_countdown() {
+        assert_eq!(remaining_time(0, 0), None);
+        assert_eq!(
+            remaining_time(496_000, 0).as_deref(),
+            Some("-8:16"),
+            "a fresh track should show its full length as time left"
+        );
+        assert_eq!(remaining_time(496_000, 30_000).as_deref(), Some("-7:46"));
+        assert_eq!(remaining_time(496_000, 496_000).as_deref(), Some("-0:00"));
+        assert_eq!(
+            remaining_time(496_000, 600_000).as_deref(),
+            Some("-0:00"),
+            "a stale position past the end must clamp at zero"
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
